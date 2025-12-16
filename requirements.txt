@@ -1,0 +1,19 @@
+hopsworks[python]>=3.6.0
+pandas
+polars
+pyspark
+numpy>=1.26.4
+requests>=2.32.3
+retry-requests==2.0.0
+scikit-learn>=1.5.2
+matplotlib>=3.9.2
+geopy==2.4.1
+joblib>=1.4.2
+pydantic-settings>=2.6.1
+pyyaml>=6.0.2
+tqdm>=4.66.5
+great_expectations==0.18.12
+jupyter>=1.1.1
+gtfs-realtime-bindings
+protobuf
+# p7zip

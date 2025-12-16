@@ -1,0 +1,26 @@
+[project]
+name = "happysardines"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "geopy==2.4.1",
+    "great-expectations==0.18.12",
+    "gtfs-realtime-bindings>=2.0.0",
+    "hopsworks[python]>=3.6.0",
+    "joblib>=1.4.2",
+    "jupyter>=1.1.1",
+    "matplotlib>=3.9.2",
+    "numpy>=1.26.4",
+    "pandas>=2.3.3",
+    "polars>=1.36.1",
+    "protobuf>=4.25.8",
+    "pydantic-settings>=2.6.1",
+    "pyspark>=4.1.0",
+    "pyyaml>=6.0.2",
+    "requests>=2.32.3",
+    "retry-requests==2.0.0",
+    "scikit-learn>=1.5.2",
+    "tqdm>=4.66.5",
+]
