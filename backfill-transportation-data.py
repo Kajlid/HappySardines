@@ -5,24 +5,26 @@ from datetime import datetime, timedelta
 import os
 import json
 import time
+import gc
 import numpy as np
 from dotenv import load_dotenv
 import great_expectations as ge
 import zipfile
 import py7zr
+import tempfile
 import base64
-try:
-    from gtfs_realtime_bindings import gtfs_realtime_pb2
-except Exception:
-    gtfs_realtime_pb2 = None
+from google.transit import gtfs_realtime_pb2
 
 # Configuration
 load_dotenv()
 MAX_RETRIES = 3
 WAIT_SECONDS = 5  # wait between retries
-KODA_RT_API_BASE_URL = "https://api.koda.trafiklab.se/KoDa/api/v2/gtfs-rt/sl/VehiclePositions"   # real-time data of the vehicles
-KODA_STATIC_API_BASE_URL = "https://api.koda.trafiklab.se/KoDa/api/v2/gtfs-static/sl"       # static data of the vehicles
+KODA_RT_API_BASE_URL = "https://api.koda.trafiklab.se/KoDa/api/v2/gtfs-rt/otraf/VehiclePositions"   # real-time data of the vehicles
+KODA_STATIC_API_BASE_URL = "https://api.koda.trafiklab.se/KoDa/api/v2/gtfs-static/otraf"       # static data of the vehicles
 CHECK_INTERVAL = 60  # Interval in seconds
+
+hopsworks_key = os.getenv("HOPSWORKS_API_KEY")
+hopsworks_project = os.getenv("HOPSWORKS_PROJECT")
 
 out_dir = os.environ["out_dir"]
 # Create the output folder for data
@@ -66,15 +68,12 @@ def parse_vehiclepositions(content: bytes, date: str, hour: int):
     """
     rows = []
 
-    if gtfs_realtime_pb2 is None:
-        raise RuntimeError("gtfs_realtime_bindings is not available.")
-
     feed = gtfs_realtime_pb2.FeedMessage()
     feed.ParseFromString(content)
 
     for entity in feed.entity:
         # skip entities without 'vehicle'
-        if not getattr(entity, 'vehicle', None):
+        if not entity.HasField("vehicle"):
             continue
         v = entity.vehicle
 
@@ -140,38 +139,48 @@ def fetch_rt_data(date, hour):
     
     print(f"Checking RT data for date: {date}, hour: {hour}")
 
+    rows = []
     try:
         response = requests.get(url, stream=True)
         print(f"HTTP {response.status_code} response received.")
         
-        try:
-            text_preview = response.text[:100]
-            print("Response body preview:", text_preview)
-        except Exception as e:
-            print("Could not read response text:", e)
-
-        # Save file locally if content exists
         if response.status_code == 200 and response.content:
-            # file_path = os.path.join(out_dir, f"vehiclepositions-{date}-{hour}.bin")
-            # with open(file_path, "wb") as f:
-            #     f.write(response.content)
-            # print(f"File saved: {file_path}")
             
-            # Parse and return rows for this hour
-            try:
-                parsed = parse_vehiclepositions(response.content, date, hour)
-                return parsed
-            except Exception as e:
-                print(f"Failed to parse GTFS-RT content: {e}")
-                return []
+            # Save 7z to a temporary file
+            with tempfile.NamedTemporaryFile(suffix=".7z") as tmp_7z:
+                tmp_7z.write(response.content)
+                tmp_7z_path = tmp_7z.name
+                
+                # Extract protobuf(s) from 7z
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    with py7zr.SevenZipFile(tmp_7z.name, mode='r') as archive:
+                        archive.extractall(path=tmp_dir)
+                        all_files = archive.getnames()  # lists all files including paths
+                        # print("Files in archive:", all_files)
+                        for rel_path in all_files:
+                            if rel_path.endswith(".pb"):
+                                file_path = os.path.join(tmp_dir, rel_path)
+                                # print("Processing:", file_path, "Size:", os.path.getsize(file_path))
+                                with open(file_path, "rb") as f:
+                                    content = f.read()  # raw protobuf binary
+                                    try:
+                                        rows.extend(parse_vehiclepositions(content, date, hour))
+                                    except Exception as e:
+                                        print(f"Failed to parse protobuf {rel_path}: {e}")
+                                    
+                os.remove(tmp_7z_path)
+                print(f"Hour {hour}: {len(rows)} vehicle positions parsed")
+                return rows
+                
+        
         else:
             print("No data to save.")
             return []
+
         
     except Exception as e:
         print(f"Error fetching RT data: {e}")
 
-        
         
 def fetch_static_data(date):
     url = f"{KODA_STATIC_API_BASE_URL}?date={date}&key={os.environ['KODA_API_KEY']}"
@@ -203,7 +212,7 @@ def fetch_static_data(date):
             
     # After writing data to zip, we create dataframes:
     with zipfile.ZipFile(static_file_path, 'r') as z:
-        print("Files inside ZIP:", z.namelist())
+        # print("Files inside ZIP:", z.namelist())
         
         with z.open('stop_times.txt') as f:
             stop_times_df = pd.read_csv(f)
@@ -262,20 +271,21 @@ def fetch_static_data(date):
 
     calendar_fact = pd.DataFrame(records)
     
+    if calendar_fact.empty:
+        calendar_fact = pd.DataFrame(columns=['service_id', 'date', 'is_active'])
+
+    
     # Override activity of service on special days when service does not follow schedule
     adds = calendar_dates_df[calendar_dates_df.exception_type == 1]
     removes = calendar_dates_df[calendar_dates_df.exception_type == 2]
+    
+    print(calendar_df.columns)
+    print(calendar_dates_df.columns)
 
     calendar_fact = (
         calendar_fact
         .merge(adds.assign(is_active=1), on=["service_id", "date"], how="outer")
         .merge(removes.assign(is_active=0), on=["service_id", "date"], how="left", suffixes=("", "_remove"))
-    )
-
-    calendar_fact["is_active"] = (
-        calendar_fact["is_active"]
-        .fillna(calendar_fact["is_active_remove"])
-        .fillna(1)
     )
     
     # Sort and normalize geographic dimension table
@@ -291,59 +301,317 @@ def fetch_static_data(date):
     )
     
     return trip_dim, trip_stops_fact, calendar_fact, shapes_df
+            
+            
+def validate_with_expectations(df, expectation_suite, name="dataset"):
+    """
+    Run Great Expectations validation before ingestion.
+    Prints results and raises an error if validation fails.
+    """
+    ge_df = ge.from_pandas(df)
+    validation_result = ge_df.validate(expectation_suite=expectation_suite)
     
-
-def extract_rt_data():
-    for hour in range(24):
-        rt_file = os.path.join(out_dir, f"otraf-vehiclepositions-2025-12-10-{hour}.bin")  
-
-        print("File size:", os.path.getsize(rt_file))
-            
-        extract_dir = os.path.join(out_dir, "extracted_rt")
-        os.makedirs(extract_dir, exist_ok=True)
-            
-        with py7zr.SevenZipFile(rt_file, mode='r') as z:
-            z.extractall(path=extract_dir)     
-            
-def make_requests(dates):
+    if not validation_result.success:
+        print(f"Validation failed for {name}")
+        for res in validation_result.results:
+            if not res.success:
+                print(f" - {res.expectation_config.expectation_type} failed: {res.result}")
+        raise ValueError(f"Validation failed for {name}.")
+    else:
+        print(f"Validation passed for {name}")  
+        
+        
+def ingest_static_data(dates, project):
+    fs = project.get_feature_store()
     print(dates)
-    all_rows = []
+    
+    trip_info_fg = fs.get_or_create_feature_group(
+        name="static_trip_info_fg",
+        version=1,
+        primary_key=["trip_id", "stop_id", "stop_sequence"],
+        description="Static information about a planned trip and it's stops",
+        online_enabled=False
+    )
     for date in dates:
         date_string = datetime.strftime(date, "%Y-%m-%d")
-        print(f"Processing date: {date_string}")
-        trip_dim, trip_stops_fact, calendar_fact, shapes_df = fetch_static_data(date_string)
+        file_name_date = date_string.replace("-", "_")
+        static_file_path = os.path.join(out_dir, f"gtfs_static_{file_name_date}.zip")
+        if not os.path.exists(static_file_path):
+            print(f"Processing date: {date_string}")
+            trip_static_df, trip_stops_fact_df, calendar_fact_df, shapes_df = fetch_static_data(date_string)
+            
+            # Geographic information stored in object storage
+            # OBS does not work
+            # store_shapes_dataset(
+            #     project=project,
+            #     shapes_df=shapes_df,
+            #     feed_date=date_string
+            # )
+
+            static_trip_stops_df = (trip_stops_fact_df
+                .merge(trip_static_df, on="trip_id", how="left", validate="many_to_one")
+            )
+
+            static_trip_stops_df.dropna(
+                subset=["trip_id", "stop_id", "stop_sequence"],
+                inplace=True
+            )
+            
+            static_trip_stops_df = static_trip_stops_df.drop_duplicates(subset=["trip_id", "stop_id", "stop_sequence"])
+            
+            trip_info_fg.insert(clean_column_names(static_trip_stops_df),
+                write_options={"wait_for_job": True})
+            
+    
+            
+def ingest_rt_data(dates, project):
+    fs = project.get_feature_store()
+    print(dates)
+    
+    REQUIRED_COLUMNS = [
+        "trip_id",
+        "window_start",
+        "avg_speed",
+        "avg_bearing",
+        "max_speed",
+        "occupancy_status_mode",
+        "n_positions",
+    ]
+    
+    # Data expectations
+    agg_expectation_suite = ge.core.ExpectationSuite(
+        expectation_suite_name="agg_expectation_suite"
+    )
+    
+    # agg_expectation_suite.add_expectation(
+    # ge.core.ExpectationConfiguration(
+    #         expectation_type="expect_table_columns_to_match_set",
+    #         kwargs={
+    #             "column_set": REQUIRED_COLUMNS,
+    #             "exact_match": False  # allow future additions
+    #         }
+    #     )
+    # )
+    
+    agg_expectation_suite.add_expectation(
+        ge.core.ExpectationConfiguration(
+            expectation_type="expect_compound_columns_to_be_unique",
+            kwargs={
+                "column_list": ["trip_id", "window_start"]
+            }
+        )
+    )
+    
+    # agg_expectation_suite.add_expectation(
+    #     ge.core.ExpectationConfiguration(
+    #         expectation_type="expect_column_values_to_be_of_type",
+    #         kwargs={
+    #             "column": "window_start",
+    #             "type_": "Timestamp"
+    #         }
+    #     )
+    # )
+    
+    # agg_expectation_suite.add_expectation(
+    #     ge.core.ExpectationConfiguration(
+    #         expectation_type="expect_column_values_to_be_between",
+    #         kwargs={
+    #             "column": "max_speed",
+    #             "min_value": 0,
+    #             "max_value": 100,
+    #             "allow_nulls": True
+    #         }
+    #     )
+    # )
+
+    
+    for col in ["trip_id", "window_start"]:
+        agg_expectation_suite.add_expectation(
+            ge.core.ExpectationConfiguration(
+                expectation_type="expect_column_values_to_not_be_null",
+                kwargs={"column": col}
+            )
+        )
+    
+    # For model to predict occupancy in near-real time, "latest summary"
+    vehicle_trip_5min_fg = fs.get_or_create_feature_group(
+        name="vehicle_trip_5min_fg",  
+        version=1,
+        primary_key=["trip_id", "window_start"],
+        event_time="window_start",
+        description="5-minute aggregated vehicle-trip speed and occupancy features",
+        expectation_suite=agg_expectation_suite,
+        online_enabled=False
+    )
+    
+    
+    for date in dates:
+        date_string = datetime.strftime(date, "%Y-%m-%d")
+        dfs = []
         for hour in range(24):
             print(f"Processing hour: {hour}")
             rows = fetch_rt_data(date_string, hour)
-            if rows:
-                all_rows.extend(rows)
-        print(f"Completed processing for date: {date_string}\n")
-    # Build dataframe from collected rows and save
-    if all_rows:
-        df = pd.DataFrame(all_rows)
-        
-        df_enriched = df.merge(
-            trip_dim,
-            on="trip_id",
-            how="left",
-            validate="many_to_one"
-        )
-        
-        # We want only valid trips:
-        df_enriched["date"] = pd.to_datetime(df_enriched["date"])
+            if not rows:
+                continue
+            
+            print(f"Fetched {len(rows)} rows")
+            rt_df = pd.DataFrame(rows)
 
-        df_enriched = df_enriched.merge(
-            calendar_fact[calendar_fact.is_active == 1],
-            on=["service_id", "date"],
-            how="inner"
+            # 5-min aggregation
+            vehicle_trip_5min_df = get_temporal_trip_features(rt_df)
+            
+            # remove rows with empty trip id 
+            vehicle_trip_5min_df = vehicle_trip_5min_df[vehicle_trip_5min_df["trip_id"].notna() & (vehicle_trip_5min_df["trip_id"] != "")]
+            vehicle_trip_5min_df.dropna(subset=["trip_id", "occupancy_status_mode", "window_start"], inplace=True)
+            vehicle_trip_5min_df = vehicle_trip_5min_df[
+                vehicle_trip_5min_df["window_start"].notna()
+            ]
+            vehicle_trip_5min_df["window_start"] = pd.to_datetime(vehicle_trip_5min_df["window_start"]).dt.floor("min")
+            
+            # remove duplicated columns
+            vehicle_trip_5min_df = vehicle_trip_5min_df.loc[:, ~vehicle_trip_5min_df.columns.duplicated()]
+            
+            # re-aggregate duplicates
+            vehicle_trip_5min_df = (
+                vehicle_trip_5min_df
+                .groupby(["trip_id", "window_start"], as_index=False)
+                .agg(
+                    avg_speed=("avg_speed", "mean"),
+                    max_speed=("max_speed", "max"),
+                    n_positions=("n_positions", "sum"),
+                    speed_std=("speed_std", "mean"),
+                    avg_bearing=("avg_bearing", "mean"),
+                    occupancy_status_mode=("occupancy_status_mode", lambda x: x.mode().iloc[0] if not x.mode().empty else None)
+                )
+            )
+
+            dfs.append(vehicle_trip_5min_df)
+        
+        big_df = pd.concat(dfs, ignore_index=True)
+        # Data validation before ingestion
+        validate_with_expectations(big_df, agg_expectation_suite, name="Aggregated real-time features")
+        vehicle_trip_5min_fg.insert(       # daily inserts
+            clean_column_names(big_df),
+            write_options={"wait_for_job": True}
         )
         
-        df_enriched = clean_column_names(df_enriched)
+        # Discard to free memory
+        del dfs, big_df
+        gc.collect()
+            
+        print(f"Completed ingestion for date: {date_string}\n")
+    
+    
+def get_temporal_trip_features(rt_df):
+    
+    rt_df = rt_df.sort_values("timestamp")
+    rt_df["window_start"] = (
+        rt_df["timestamp"]
+        .dt.floor("5min")
+    )
+    
+    # remove duplicated columns
+    rt_df = rt_df.loc[:, ~rt_df.columns.duplicated()]
+    
+    rt_df = rt_df[rt_df["trip_id"].notna() & (rt_df["trip_id"] != "")]
+    
+    # Vehicle trip features every 5 minutes
+    vehicle_trip_5min_df = (rt_df
+    .groupby(["trip_id", "window_start"], as_index=False)
+    .agg(
+        avg_speed=("speed", "mean"),
+        max_speed=("speed", "max"),
+        n_positions=("speed", "count"),
+        speed_std=("speed", "std"),
+        avg_bearing=("bearing", "mean"),
+        occupancy_status_mode=("occupancy_status", lambda x: x.mode().iloc[0] if not x.mode().empty else None),   # most common status during time interval
+    )
+    )
+    
+    # There should only be one trip per window
+    vehicle_trip_5min_df = vehicle_trip_5min_df.drop_duplicates(subset=["trip_id", "window_start"])
+    
+    return vehicle_trip_5min_df
+    
+
+def get_temporal_route_features(rt_df):
+    # Route information every 5 minutes
+    route_5min_df = (rt_df
+    .assign(
+        window_start=lambda df: df["timestamp"].dt.floor("5min")
+    ).groupby(["route_id", "window_start"])
+    .agg(
+        avg_speed=("speed", "mean"),
+        vehicle_count=("vehicle_id", "nunique"),
+        occupancy_mode=("occupancy_status", lambda x: x.mode().iloc[0] if not x.mode().empty else None)
+    ).reset_index()
+    )
+    
+    return route_5min_df
+
+def store_shapes_dataset(project, shapes_df, feed_date: str):
+    """
+    Store GTFS shapes in Hopsworks object storage (Datasets).
+    """
+    shapes_df = clean_column_names(shapes_df)
+
+    dataset_base = "gtfs/shapes"
+    dataset_path = f"{dataset_base}/feed_date={feed_date}"
+
+    # Create dataset if it does not exist
+    try:
+        project.get_dataset(dataset_base)
+    except Exception:
+        project.create_dataset(
+            name=dataset_base,
+            description="GTFS shapes stored per feed version/date"
+        )
+
+    local_tmp = f"/tmp/shapes_{feed_date}.parquet"
+    shapes_df.to_parquet(local_tmp, index=False)
+
+    dataset = project.get_dataset(dataset_base)
+    dataset.upload(local_tmp, dataset_path, overwrite=True)
+
+    print(f"Stored shapes dataset at: {dataset_path}")
+
+    
+def main():
+    project = hopsworks.login(host="eu-west.cloud.hopsworks.ai", project=hopsworks_project, api_key_value=hopsworks_key)
+    fs = project.get_feature_store()
+    
+    # Ingest data over the last 2 years
+    start_date = datetime.now() - timedelta(days=730)  # 2 years ago
+    end_date = datetime.now() - timedelta(days=1)     # yesterday
+    
+    # Keep track of months we have ingested static data for
+    ingested_months = set()
+    
+    # Iterate week by week
+    for week_start in pd.date_range(start=start_date, end=end_date, freq="W-MON"):  # weeks starting on Monday
+        week_end = week_start + pd.Timedelta(days=6)
+        month_key = week_start.strftime("%Y-%m")
+        if week_end > end_date:
+            week_end = end_date
         
-        return df_enriched
+        print(f"Ingesting week: {week_start.date()} - {week_end.date()}")
+        
+        dates = pd.date_range(week_start, week_end, normalize=True) # start at midnight each date
+        
+        if month_key not in ingested_months:
+            # Use first date of the month to fetch static GTFS
+            first_of_month = week_start.replace(day=1)
+            ingest_static_data([first_of_month], project)
+            ingested_months.add(month_key)
+            
+        ingest_rt_data(dates, project=project)
+        print(f"Completed ingestion for week starting {week_start.date()}")
+
+        gc.collect()    # memory cleanup
+
     
-    else:
-        return []
-    
+
+if __name__=='__main__':
+    main()
         
         
