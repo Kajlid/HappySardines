@@ -1,7 +1,6 @@
 hopsworks[python]>=3.6.0
 pandas
 polars
-pyspark
 numpy>=1.26.4
 requests>=2.32.3
 retry-requests==2.0.0
@@ -16,4 +15,5 @@ great_expectations==0.18.12
 jupyter>=1.1.1
 gtfs-realtime-bindings
 protobuf
-# p7zip
+py7zr
+pyarrow
