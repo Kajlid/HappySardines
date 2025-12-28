@@ -16,3 +16,4 @@ jupyter>=1.1.1
 gtfs-realtime-bindings
 protobuf
 py7zr
+pyarrow

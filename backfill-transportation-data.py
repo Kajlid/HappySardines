@@ -12,6 +12,7 @@ import great_expectations as ge
 import zipfile
 import py7zr
 import tempfile
+import pyarrow as pa
 import base64
 from google.transit import gtfs_realtime_pb2
 
@@ -92,7 +93,7 @@ def parse_vehiclepositions(content: bytes, date: str, hour: int):
         vehicle_obj = getattr(v, 'vehicle', None) or v    # v.vehicle
 
         vehicle_id = getattr(vehicle_obj, 'id', None)
-        vehicle_label = getattr(vehicle_obj, 'label', None)
+        # vehicle_label = getattr(vehicle_obj, 'label', None)
 
         row = {
             'feed_entity_id': getattr(entity, 'id', None),
@@ -168,7 +169,7 @@ def fetch_rt_data(date, hour):
                                     except Exception as e:
                                         print(f"Failed to parse protobuf {rel_path}: {e}")
                                     
-                os.remove(tmp_7z_path)
+                # os.remove(tmp_7z_path)
                 print(f"Hour {hour}: {len(rows)} vehicle positions parsed")
                 return rows
                 
@@ -328,10 +329,18 @@ def ingest_static_data(dates, project):
     trip_info_fg = fs.get_or_create_feature_group(
         name="static_trip_info_fg",
         version=1,
-        primary_key=["trip_id", "stop_id", "stop_sequence"],
-        description="Static information about a planned trip and it's stops",
+        primary_key=["trip_id", "feed_date"],
+        description="Static information about a planned trip",
         online_enabled=False
     )
+    
+    trip_and_stops_info_fg = fs.get_or_create_feature_group(
+        name="static_trip_and_stops_info_fg",
+        version=1,
+        primary_key=["trip_id", "stop_sequence", "feed_date"],
+        description="Static information about a planned trip",
+        online_enabled=False
+    ) 
     for date in dates:
         date_string = datetime.strftime(date, "%Y-%m-%d")
         file_name_date = date_string.replace("-", "_")
@@ -340,26 +349,36 @@ def ingest_static_data(dates, project):
             print(f"Processing date: {date_string}")
             trip_static_df, trip_stops_fact_df, calendar_fact_df, shapes_df = fetch_static_data(date_string)
             
-            # Geographic information stored in object storage
-            # OBS does not work
-            # store_shapes_dataset(
-            #     project=project,
-            #     shapes_df=shapes_df,
-            #     feed_date=date_string
-            # )
+            trip_static_df["feed_date"] = date
 
             static_trip_stops_df = (trip_stops_fact_df
                 .merge(trip_static_df, on="trip_id", how="left", validate="many_to_one")
             )
+            
+            static_trip_stops_df["feed_date"] = date
 
-            static_trip_stops_df.dropna(
-                subset=["trip_id", "stop_id", "stop_sequence"],
+            trip_static_df.dropna(
+                subset=["trip_id"],
                 inplace=True
             )
             
             static_trip_stops_df = static_trip_stops_df.drop_duplicates(subset=["trip_id", "stop_id", "stop_sequence"])
             
-            trip_info_fg.insert(clean_column_names(static_trip_stops_df),
+            # Convert NaNs to nullable strings
+            for col, dtype in trip_static_df.dtypes.items():
+                if dtype == "object":
+                    trip_static_df[col] = trip_static_df[col].where(
+                        trip_static_df[col].notna(), None
+                    )
+                    
+            for col, dtype in static_trip_stops_df.dtypes.items():
+                if dtype == "object":
+                    static_trip_stops_df[col] = static_trip_stops_df[col].where(static_trip_stops_df[col].notna(), None)
+            
+            trip_info_fg.insert(clean_column_names(trip_static_df),
+                write_options={"wait_for_job": True})
+            
+            trip_and_stops_info_fg.insert(clean_column_names(static_trip_stops_df),
                 write_options={"wait_for_job": True})
             
     
@@ -368,63 +387,11 @@ def ingest_rt_data(dates, project):
     fs = project.get_feature_store()
     print(dates)
     
-    REQUIRED_COLUMNS = [
-        "trip_id",
-        "window_start",
-        "avg_speed",
-        "avg_bearing",
-        "max_speed",
-        "occupancy_status_mode",
-        "n_positions",
-    ]
-    
     # Data expectations
     agg_expectation_suite = ge.core.ExpectationSuite(
         expectation_suite_name="agg_expectation_suite"
     )
-    
-    # agg_expectation_suite.add_expectation(
-    # ge.core.ExpectationConfiguration(
-    #         expectation_type="expect_table_columns_to_match_set",
-    #         kwargs={
-    #             "column_set": REQUIRED_COLUMNS,
-    #             "exact_match": False  # allow future additions
-    #         }
-    #     )
-    # )
-    
-    agg_expectation_suite.add_expectation(
-        ge.core.ExpectationConfiguration(
-            expectation_type="expect_compound_columns_to_be_unique",
-            kwargs={
-                "column_list": ["trip_id", "window_start"]
-            }
-        )
-    )
-    
-    # agg_expectation_suite.add_expectation(
-    #     ge.core.ExpectationConfiguration(
-    #         expectation_type="expect_column_values_to_be_of_type",
-    #         kwargs={
-    #             "column": "window_start",
-    #             "type_": "Timestamp"
-    #         }
-    #     )
-    # )
-    
-    # agg_expectation_suite.add_expectation(
-    #     ge.core.ExpectationConfiguration(
-    #         expectation_type="expect_column_values_to_be_between",
-    #         kwargs={
-    #             "column": "max_speed",
-    #             "min_value": 0,
-    #             "max_value": 100,
-    #             "allow_nulls": True
-    #         }
-    #     )
-    # )
 
-    
     for col in ["trip_id", "window_start"]:
         agg_expectation_suite.add_expectation(
             ge.core.ExpectationConfiguration(
@@ -433,17 +400,25 @@ def ingest_rt_data(dates, project):
             )
         )
     
-    # For model to predict occupancy in near-real time, "latest summary"
-    vehicle_trip_5min_fg = fs.get_or_create_feature_group(
-        name="vehicle_trip_5min_fg",  
-        version=1,
+    # vehicle_trip_rt_fg = fs.get_or_create_feature_group(
+    #     name="vehicle_trip_rt_fg",  
+    #     version=1,
+    #     primary_key=["vehicle_id", "trip_id", "timestamp"],
+    #     event_time="timestamp",
+    #     description="Real-time vehicle-trip, speed, and occupancy features",
+    #     online_enabled=True
+    # )
+    
+    # For model to predict occupancy on aggregated features
+    vehicle_trip_agg_fg = fs.get_or_create_feature_group(
+        name="vehicle_trip_agg_fg",  
+        version=2,
         primary_key=["trip_id", "window_start"],
         event_time="window_start",
-        description="5-minute aggregated vehicle-trip speed and occupancy features",
+        description="1 minute windows of vehicle-trip, speed, and occupancy features",
         expectation_suite=agg_expectation_suite,
         online_enabled=False
     )
-    
     
     for date in dates:
         date_string = datetime.strftime(date, "%Y-%m-%d")
@@ -456,98 +431,87 @@ def ingest_rt_data(dates, project):
             
             print(f"Fetched {len(rows)} rows")
             rt_df = pd.DataFrame(rows)
+            rt_df = rt_df.loc[:, ~rt_df.columns.duplicated()]
 
-            # 5-min aggregation
-            vehicle_trip_5min_df = get_temporal_trip_features(rt_df)
-            
-            # remove rows with empty trip id 
-            vehicle_trip_5min_df = vehicle_trip_5min_df[vehicle_trip_5min_df["trip_id"].notna() & (vehicle_trip_5min_df["trip_id"] != "")]
-            vehicle_trip_5min_df.dropna(subset=["trip_id", "occupancy_status_mode", "window_start"], inplace=True)
-            vehicle_trip_5min_df = vehicle_trip_5min_df[
-                vehicle_trip_5min_df["window_start"].notna()
-            ]
-            vehicle_trip_5min_df["window_start"] = pd.to_datetime(vehicle_trip_5min_df["window_start"]).dt.floor("min")
-            
-            # remove duplicated columns
-            vehicle_trip_5min_df = vehicle_trip_5min_df.loc[:, ~vehicle_trip_5min_df.columns.duplicated()]
-            
-            # re-aggregate duplicates
-            vehicle_trip_5min_df = (
-                vehicle_trip_5min_df
-                .groupby(["trip_id", "window_start"], as_index=False)
-                .agg(
-                    avg_speed=("avg_speed", "mean"),
-                    max_speed=("max_speed", "max"),
-                    n_positions=("n_positions", "sum"),
-                    speed_std=("speed_std", "mean"),
-                    avg_bearing=("avg_bearing", "mean"),
-                    occupancy_status_mode=("occupancy_status_mode", lambda x: x.mode().iloc[0] if not x.mode().empty else None)
-                )
-            )
-
-            dfs.append(vehicle_trip_5min_df)
+            dfs.append(clean_column_names(rt_df))
         
-        big_df = pd.concat(dfs, ignore_index=True)
+        
+        if not dfs:
+            continue
+        
+        daily_rt_df = pd.concat(dfs, ignore_index=True)
+        
+        # Remove any duplicated columns (by name)
+        daily_rt_df = daily_rt_df.loc[:, ~daily_rt_df.columns.duplicated()]
+        print("big_df columns:", daily_rt_df.columns)
+        
+        # Now create window_start once, for the whole day
+        daily_rt_df['timestamp'] = pd.to_datetime(daily_rt_df['timestamp'], unit='s') # to_datetime assumes nanoseconds by default
+
+        # Remove rows without trip_id or vehicle_id
+        daily_rt_df = daily_rt_df[daily_rt_df['trip_id'].notna() & daily_rt_df['vehicle_id'].notna()]
+
+        # vehicle_trip_rt_fg.insert(       # daily inserts
+        #     clean_column_names(daily_rt_df),
+        #     write_options={"wait_for_job": False}
+        # )
+        
+        daily_aggregated_df = get_aggregated_temporal_trip_features(daily_rt_df)
+        # Drop duplicates in the key columns
+        daily_aggregated_df = daily_aggregated_df.drop_duplicates(subset=["trip_id", "window_start"], keep="last")
+        
         # Data validation before ingestion
-        validate_with_expectations(big_df, agg_expectation_suite, name="Aggregated real-time features")
-        vehicle_trip_5min_fg.insert(       # daily inserts
-            clean_column_names(big_df),
-            write_options={"wait_for_job": True}
+        validate_with_expectations(daily_aggregated_df, agg_expectation_suite, name="Aggregated vehicle features")
+        
+        vehicle_trip_agg_fg.insert(
+            clean_column_names(daily_aggregated_df),
+            write_options={"wait_for_job": False}
         )
         
+        
         # Discard to free memory
-        del dfs, big_df
+        del dfs, daily_rt_df, daily_aggregated_df
         gc.collect()
             
         print(f"Completed ingestion for date: {date_string}\n")
     
     
-def get_temporal_trip_features(rt_df):
+def get_aggregated_temporal_trip_features(rt_df):
+    rt_df = rt_df.sort_values(["timestamp", "trip_id", "vehicle_id"])  
+    rt_df['window_start'] = rt_df['timestamp'].dt.floor('1min')    # create windows of a minute
     
-    rt_df = rt_df.sort_values("timestamp")
-    rt_df["window_start"] = (
-        rt_df["timestamp"]
-        .dt.floor("5min")
+    print("rt_df columns: ", rt_df.columns)
+    
+    vehicle_trip_1min_df = (
+        rt_df
+        .groupby(["trip_id", "window_start"], as_index=False)
+        .agg(
+            vehicle_id=("vehicle_id",              # the trip might have switched vehicle
+                            lambda x: x.mode().iloc[0] if not x.mode().empty else None),
+            avg_speed=("speed", "mean"),
+            max_speed=("speed", "max"),
+            n_positions=("speed", "count"),
+            speed_std=("speed", "std"),
+            lat_min=("position_lat", "min"),
+            lat_max=("position_lat", "max"),
+            lat_mean=("position_lat", "mean"),
+            lon_min=("position_lon", "min"),
+            lon_max=("position_lon", "max"),
+            lon_mean=("position_lon", "mean"),
+            bearing_min=("bearing", "min"),
+            bearing_max=("bearing", "max"),
+            occupancy_mode=("occupancy_status",
+                            lambda x: x.mode().iloc[0] if not x.mode().empty else None)
+        )
     )
     
-    # remove duplicated columns
-    rt_df = rt_df.loc[:, ~rt_df.columns.duplicated()]
-    
-    rt_df = rt_df[rt_df["trip_id"].notna() & (rt_df["trip_id"] != "")]
-    
-    # Vehicle trip features every 5 minutes
-    vehicle_trip_5min_df = (rt_df
-    .groupby(["trip_id", "window_start"], as_index=False)
-    .agg(
-        avg_speed=("speed", "mean"),
-        max_speed=("speed", "max"),
-        n_positions=("speed", "count"),
-        speed_std=("speed", "std"),
-        avg_bearing=("bearing", "mean"),
-        occupancy_status_mode=("occupancy_status", lambda x: x.mode().iloc[0] if not x.mode().empty else None),   # most common status during time interval
-    )
-    )
-    
-    # There should only be one trip per window
-    vehicle_trip_5min_df = vehicle_trip_5min_df.drop_duplicates(subset=["trip_id", "window_start"])
-    
-    return vehicle_trip_5min_df
-    
+    vehicle_trip_1min_df["date"] = vehicle_trip_1min_df["window_start"].dt.date
+    vehicle_trip_1min_df["hour"] = vehicle_trip_1min_df["window_start"].dt.hour
+    vehicle_trip_1min_df["day_of_week"] = vehicle_trip_1min_df["window_start"].dt.weekday
+    vehicle_trip_1min_df["window_start"] = pd.to_datetime(vehicle_trip_1min_df["window_start"])
 
-def get_temporal_route_features(rt_df):
-    # Route information every 5 minutes
-    route_5min_df = (rt_df
-    .assign(
-        window_start=lambda df: df["timestamp"].dt.floor("5min")
-    ).groupby(["route_id", "window_start"])
-    .agg(
-        avg_speed=("speed", "mean"),
-        vehicle_count=("vehicle_id", "nunique"),
-        occupancy_mode=("occupancy_status", lambda x: x.mode().iloc[0] if not x.mode().empty else None)
-    ).reset_index()
-    )
-    
-    return route_5min_df
+    return vehicle_trip_1min_df
+
 
 def store_shapes_dataset(project, shapes_df, feed_date: str):
     """
@@ -577,11 +541,11 @@ def store_shapes_dataset(project, shapes_df, feed_date: str):
 
     
 def main():
-    project = hopsworks.login(host="eu-west.cloud.hopsworks.ai", project=hopsworks_project, api_key_value=hopsworks_key)
-    fs = project.get_feature_store()
-    
-    # Ingest data over the last 2 years
-    start_date = datetime.now() - timedelta(days=730)  # 2 years ago
+    # project = hopsworks.login(host=hopsworks_host, project=hopsworks_project, api_key_value=hopsworks_key, engine="python")
+    project = hopsworks.login(project=hopsworks_project, api_key_value=hopsworks_key)
+        
+    # Ingest data over the last month
+    start_date = datetime.now() - timedelta(days=30)  # 1 month
     end_date = datetime.now() - timedelta(days=1)     # yesterday
     
     # Keep track of months we have ingested static data for
