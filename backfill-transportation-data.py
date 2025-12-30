@@ -545,31 +545,36 @@ def main():
     project = hopsworks.login(project=hopsworks_project, api_key_value=hopsworks_key)
         
     # Ingest data over the last month
-    start_date = datetime.now() - timedelta(days=30)  # 1 month
-    end_date = datetime.now() - timedelta(days=1)     # yesterday
+    # start_date = datetime.now() - timedelta(days=30)  # 1 month
+    # end_date = datetime.now() - timedelta(days=1)     # yesterday
+    
+    start_date = datetime.strptime("2025-12-16", "%Y-%m-%d").strftime("%d-%m-%Y")
+    print(start_date)
+    end_date = datetime.now() - timedelta(days=1)
     
     # Keep track of months we have ingested static data for
     ingested_months = set()
     
     # Iterate week by week
-    for week_start in pd.date_range(start=start_date, end=end_date, freq="W-MON"):  # weeks starting on Monday
-        week_end = week_start + pd.Timedelta(days=6)
-        month_key = week_start.strftime("%Y-%m")
+    # for week_start in pd.date_range(start=start_date, end=end_date, freq="W-MON"):  # weeks starting on Monday
+    for day in pd.date_range(start=start_date, end=end_date):
+        week_end = day + pd.Timedelta(days=6)
+        month_key = day.strftime("%Y-%m")
         if week_end > end_date:
             week_end = end_date
         
-        print(f"Ingesting week: {week_start.date()} - {week_end.date()}")
+        print(f"Ingesting week: {day.date()} - {week_end.date()}")
         
-        dates = pd.date_range(week_start, week_end, normalize=True) # start at midnight each date
+        dates = pd.date_range(day, week_end, normalize=True) # start at midnight each date
         
-        if month_key not in ingested_months:
-            # Use first date of the month to fetch static GTFS
-            first_of_month = week_start.replace(day=1)
-            ingest_static_data([first_of_month], project)
-            ingested_months.add(month_key)
+        # if month_key not in ingested_months:
+        #     # Use first date of the month to fetch static GTFS
+        #     first_of_month = day.replace(day=1)
+        #     ingest_static_data([first_of_month], project)
+        #     ingested_months.add(month_key)
             
         ingest_rt_data(dates, project=project)
-        print(f"Completed ingestion for week starting {week_start.date()}")
+        print(f"Completed ingestion for week starting {day.date()}")
 
         gc.collect()    # memory cleanup
 
