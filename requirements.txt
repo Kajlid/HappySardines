@@ -17,3 +17,4 @@ gtfs-realtime-bindings
 protobuf
 py7zr
 pyarrow
+haversine
