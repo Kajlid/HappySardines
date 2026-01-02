@@ -5,6 +5,8 @@ import requests
 import tempfile
 import zipfile
 import py7zr
+import time
+import great_expectations as ge
 from haversine import haversine, Unit
 from datetime import datetime, timedelta
 import sys
@@ -14,9 +16,12 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import gc
 
-# Add parent directory to path to import util
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from util import clean_column_names, distance_m
+# Ensure parent directory is in path for imports
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if parent_dir not in sys.path:
+    sys.path.insert(0, parent_dir)
+
+from util import clean_column_names, distance_m, validate_with_expectations
 
 load_dotenv()
 
@@ -30,64 +35,107 @@ KODA_KEY = os.environ.get("KODA_API_KEY")
 HOPSWORKS_PROJECT = os.environ.get("HOPSWORKS_PROJECT")
 HOPSWORKS_API_KEY = os.environ.get("HOPSWORKS_API_KEY")
 
-# KODA RT Data Fetching & Parsing
-def fetch_koda_rt_data(date_str: str, hour: int) -> bytes:
-    """Fetch GTFS-RT vehicle positions from KODA API for a specific date and hour."""
-    url = f"{KODA_RT_API_BASE_URL}?date={date_str}&hour={hour}&key={KODA_KEY}"
-    
-    try:
-        response = requests.get(url, stream=True, timeout=60)
-        if response.status_code == 200 and response.content:
-            return response.content
-        else:
-            print(f"  Warning: HTTP {response.status_code} for {date_str} hour {hour}")
-            return None
-    except Exception as e:
-        print(f"  Error fetching KODA RT data: {e}")
-        return None
+# Retry configuration
+MAX_RETRIES = 3
+INITIAL_BACKOFF = 2  # seconds
+MAX_BACKOFF = 30  # seconds
 
 def parse_vehiclepositions(content: bytes, date: str, hour: int):
-    """Parse GTFS-RT VehiclePositions protobuf into list of dict rows."""
-    if not content:
-        return []
+    """Parse GTFS-RT VehiclePositions protobuf content into a list of dict rows.
+
+    Uses gtfs_realtime_bindings when available, otherwise attempts a generic protobuf parse.
+    """
+    rows = []
+
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(content)
+
+    for entity in feed.entity:
+        # skip entities without 'vehicle'
+        if not entity.HasField("vehicle"):
+            continue
+        v = entity.vehicle
+
+        trip = getattr(v, 'trip', None)
+        pos = getattr(v, 'position', None)
+
+        ts = None
+        if getattr(v, 'timestamp', None):
+            try:
+                ts = int(v.timestamp)
+            except Exception:
+                ts = None
+
+        ts_dt = pd.to_datetime(ts, unit='s') if ts else None
+
+        vehicle_obj = getattr(v, 'vehicle', None) or v    # v.vehicle
+
+        vehicle_id = getattr(vehicle_obj, 'id', None)
+
+        row = {
+            'feed_entity_id': getattr(entity, 'id', None),
+            'date': date,
+            'hour': hour,
+            'timestamp': ts_dt,
+            'vehicle_id': vehicle_id,
+            'trip_id': getattr(trip, 'trip_id', None),
+            'position_lat': getattr(pos, 'latitude', None),
+            'position_lon': getattr(pos, 'longitude', None),
+            'bearing': getattr(pos, 'bearing', None),
+            'speed': getattr(pos, 'speed', None),
+            'occupancy_status': getattr(v, 'occupancy_status', None),
+        }
+        rows.append(row)
+
+    return rows
+
+# Every hour, we fetch new data from the real-time API
+def fetch_koda_rt_data(date, hour):
+    url = f"{KODA_RT_API_BASE_URL}?date={date}&hour={hour}&key={os.environ['KODA_API_KEY']}"
     
+    print(f"Checking RT data for date: {date}, hour: {hour}")
+
     rows = []
     try:
-        feed = gtfs_realtime_pb2.FeedMessage()
-        feed.ParseFromString(content)
-
-        for entity in feed.entity:
-            if not entity.HasField("vehicle"):
-                continue
+        response = requests.get(url, stream=True)
+        print(f"HTTP {response.status_code} response received.")
+        
+        if response.status_code == 200 and response.content:
             
-            v = entity.vehicle
-            trip = getattr(v, 'trip', None)
-            pos = getattr(v, 'position', None)
+            # Save 7z to a temporary file
+            with tempfile.NamedTemporaryFile(suffix=".7z") as tmp_7z:
+                tmp_7z.write(response.content)
+                tmp_7z_path = tmp_7z.name
+                
+                # Extract protobuf(s) from 7z
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    with py7zr.SevenZipFile(tmp_7z.name, mode='r') as archive:
+                        archive.extractall(path=tmp_dir)
+                        all_files = archive.getnames()  # lists all files including paths
+                        # print("Files in archive:", all_files)
+                        for rel_path in all_files:
+                            if rel_path.endswith(".pb"):
+                                file_path = os.path.join(tmp_dir, rel_path)
+                                # print("Processing:", file_path, "Size:", os.path.getsize(file_path))
+                                with open(file_path, "rb") as f:
+                                    content = f.read()  # raw protobuf binary
+                                    try:
+                                        rows.extend(parse_vehiclepositions(content, date, hour))
+                                    except Exception as e:
+                                        print(f"Failed to parse protobuf {rel_path}: {e}")
+                                    
+                # os.remove(tmp_7z_path)
+                print(f"Hour {hour}: {len(rows)} vehicle positions parsed")
+                return rows
+                
+        
+        else:
+            print("No data to save.")
+            return []
 
-            ts = getattr(v, 'timestamp', None)
-            ts_dt = pd.to_datetime(ts, unit='s') if ts else None
-
-            vehicle_obj = getattr(v, 'vehicle', None) or v
-            vehicle_id = getattr(vehicle_obj, 'id', None)
-
-            row = {
-                'feed_entity_id': getattr(entity, 'id', None),
-                'date': date,
-                'hour': hour,
-                'timestamp': ts_dt,
-                'vehicle_id': vehicle_id,
-                'trip_id': getattr(trip, 'trip_id', None),
-                'position_lat': getattr(pos, 'latitude', None),
-                'position_lon': getattr(pos, 'longitude', None),
-                'bearing': getattr(pos, 'bearing', None),
-                'speed': getattr(pos, 'speed', None),
-                'occupancy_status': getattr(v, 'occupancy_status', None),
-            }
-            rows.append(row)
+        
     except Exception as e:
-        print(f"  Error parsing protobuf: {e}")
-    
-    return rows
+        print(f"Error fetching RT data: {e}")
 
 def fetch_koda_static_data(date_str: str, tmp_dir: str) -> str:
     """Download GTFS static ZIP file from KODA API."""
@@ -111,19 +159,95 @@ def fetch_koda_static_data(date_str: str, tmp_dir: str) -> str:
         print(f"  Error downloading static data: {e}")
         return None
 
-def get_aggregated_temporal_trip_features(rt_df):
-    """Aggregate real-time vehicle data into 1-minute windows."""
-    if rt_df.empty:
-        return pd.DataFrame()
+def ingest_koda_rt_data(dates, project):
+    fs = project.get_feature_store()
+    print(dates)
     
+    # Data expectations
+    agg_expectation_suite = ge.core.ExpectationSuite(
+        expectation_suite_name="agg_expectation_suite"
+    )
+
+    for col in ["trip_id", "window_start"]:
+        agg_expectation_suite.add_expectation(
+            ge.core.ExpectationConfiguration(
+                expectation_type="expect_column_values_to_not_be_null",
+                kwargs={"column": col}
+            )
+        )
+    
+    # For model to predict occupancy on aggregated features
+    vehicle_trip_agg_fg = fs.get_or_create_feature_group(
+        name="vehicle_trip_agg_fg",  
+        version=2,
+        primary_key=["trip_id", "window_start"],
+        event_time="window_start",
+        description="1 minute windows of vehicle-trip, speed, and occupancy features",
+        expectation_suite=agg_expectation_suite,
+        online_enabled=False
+    )
+    
+    for date in dates:
+        date_string = datetime.strftime(date, "%Y-%m-%d")
+        dfs = []
+        for hour in range(24):
+            print(f"Processing hour: {hour}")
+            rows = fetch_koda_rt_data(date_string, hour)
+            if not rows:
+                continue
+            
+            print(f"Fetched {len(rows)} rows")
+            rt_df = pd.DataFrame(rows)
+            rt_df = rt_df.loc[:, ~rt_df.columns.duplicated()]
+
+            dfs.append(clean_column_names(rt_df))
+        
+        if not dfs:
+            continue
+        
+        daily_rt_df = pd.concat(dfs, ignore_index=True)
+        
+        # Remove any duplicated columns (by name)
+        daily_rt_df = daily_rt_df.loc[:, ~daily_rt_df.columns.duplicated()]
+        print("big_df columns:", daily_rt_df.columns)
+        
+        # Now create window_start once, for the whole day
+        daily_rt_df['timestamp'] = pd.to_datetime(daily_rt_df['timestamp'], unit='s') # to_datetime assumes nanoseconds by default
+
+        # Remove rows without trip_id or vehicle_id
+        daily_rt_df = daily_rt_df[daily_rt_df['trip_id'].notna() & daily_rt_df['vehicle_id'].notna()]
+
+        daily_aggregated_df = get_aggregated_temporal_trip_features(daily_rt_df)
+        # Drop duplicates in the key columns
+        daily_aggregated_df = daily_aggregated_df.drop_duplicates(subset=["trip_id", "window_start"], keep="last")
+        
+        # Data validation before ingestion
+        validate_with_expectations(daily_aggregated_df, agg_expectation_suite, name="Aggregated vehicle features")
+        
+        vehicle_trip_agg_fg.insert(
+            clean_column_names(daily_aggregated_df),
+            write_options={"wait_for_job": False}
+        )
+        
+        # Discard to free memory
+        del dfs, daily_rt_df, daily_aggregated_df
+        gc.collect()
+            
+        print(f"Completed ingestion for date: {date_string}\n")
+    
+    
+def get_aggregated_temporal_trip_features(rt_df):
     rt_df = rt_df.sort_values(["timestamp", "trip_id", "vehicle_id"])  
-    rt_df['window_start'] = rt_df['timestamp'].dt.floor('1min')
+    rt_df['window_start'] = rt_df['timestamp'].dt.floor('1min')    # create windows of a minute
+    
+    print("rt_df columns: ", rt_df.columns)
     
     vehicle_trip_1min_df = (
         rt_df
         .groupby(["trip_id", "window_start"], as_index=False)
         .agg(
-            vehicle_id=("vehicle_id", lambda x: x.mode().iloc[0] if not x.mode().empty else None),
+            vehicle_id=("vehicle_id",              # the trip might have switched vehicle
+                            lambda x: x.mode().iloc[0] if not x.mode().empty else None),
             avg_speed=("speed", "mean"),
             max_speed=("speed", "max"),
             n_positions=("speed", "count"),
@@ -136,7 +260,8 @@ def get_aggregated_temporal_trip_features(rt_df):
             lon_mean=("position_lon", "mean"),
             bearing_min=("bearing", "min"),
             bearing_max=("bearing", "max"),
-            occupancy_mode=("occupancy_status", lambda x: x.mode().iloc[0] if not x.mode().empty else None)
+            occupancy_mode=("occupancy_status",
+                            lambda x: x.mode().iloc[0] if not x.mode().empty else None)
         )
     )
     
@@ -183,25 +308,42 @@ def build_situation_query(day_start: str, day_end: str) -> str:
     """
 
 def fetch_trafikverket_situations(day_start: str, day_end: str) -> ET.Element:
-    """Fetch traffic situations from Trafikverket API."""
+    """Fetch traffic situations from Trafikverket API with exponential backoff."""
     xml_query = build_situation_query(day_start, day_end)
     
-    try:
-        response = requests.post(
-            TRAFIKVERKET_API_URL,
-            data=xml_query.encode("utf-8"),
-            headers={"Content-Type": "application/xml"},
-            timeout=60
-        )
-        
-        if response.status_code != 200:
-            print(f"  API Error {response.status_code}: {response.text[:200]}")
+    backoff = INITIAL_BACKOFF
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = requests.post(
+                TRAFIKVERKET_API_URL,
+                data=xml_query.encode("utf-8"),
+                headers={"Content-Type": "application/xml"},
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                return ET.fromstring(response.content)
+            else:
+                print(f"  API Error {response.status_code}: {response.text[:200]}")
+                if attempt < MAX_RETRIES:
+                    print(f"  Retrying in {backoff}s (attempt {attempt}/{MAX_RETRIES})...")
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, MAX_BACKOFF)
+                else:
+                    return None
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            if attempt < MAX_RETRIES:
+                print(f"  Timeout/connection error, retrying in {backoff}s (attempt {attempt}/{MAX_RETRIES})...")
+                time.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+            else:
+                print(f"  Failed after {MAX_RETRIES} attempts: {type(e).__name__}")
+                return None
+        except Exception as e:
+            print(f"  Error fetching Trafikverket data: {e}")
             return None
-        
-        return ET.fromstring(response.content)
-    except Exception as e:
-        print(f"  Error fetching Trafikverket data: {e}")
-        return None
+    
+    return None
 
 def extract_geometry_wkt(geometry_el):
     """Extract WKT geometry from Geometry element."""

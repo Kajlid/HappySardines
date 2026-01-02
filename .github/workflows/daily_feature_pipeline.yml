@@ -39,5 +39,4 @@ jobs:
           out_dir: ./data
         
         run: |
-            cd pipelines
-            python daily-feature-pipeline.py
+            python pipelines/daily-feature-pipeline.py
