@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 import numpy as np
 import gc
 
+sys.path.append(".")
 from util import *
 
 load_dotenv()
