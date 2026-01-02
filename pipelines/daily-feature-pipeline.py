@@ -13,9 +13,7 @@ from google.transit import gtfs_realtime_pb2
 import xml.etree.ElementTree as ET
 import numpy as np
 import gc
-
-sys.path.append(".")
-from util import *
+from util import clean_column_names, distance_m
 
 load_dotenv()
 
