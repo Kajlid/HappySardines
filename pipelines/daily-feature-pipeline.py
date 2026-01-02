@@ -211,7 +211,7 @@ def ingest_koda_rt_data(dates, fs):
         print("big_df columns:", daily_rt_df.columns)
         
         # Now create window_start once, for the whole day
-        daily_rt_df['timestamp'] = pd.to_datetime(daily_rt_df['timestamp'], unit='s') # to_datetime assumes nanoseconds by default
+        daily_rt_df['timestamp'] = pd.to_datetime(daily_rt_df['timestamp'], unit='s', utc=True) # to_datetime assumes nanoseconds by default
 
         # Remove rows without trip_id or vehicle_id
         daily_rt_df = daily_rt_df[daily_rt_df['trip_id'].notna() & daily_rt_df['vehicle_id'].notna()]
