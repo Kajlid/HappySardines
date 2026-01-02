@@ -13,6 +13,9 @@ from google.transit import gtfs_realtime_pb2
 import xml.etree.ElementTree as ET
 import numpy as np
 import gc
+
+# Add parent directory to path to import util
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from util import clean_column_names, distance_m
 
 load_dotenv()
