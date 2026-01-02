@@ -30,7 +30,7 @@ KODA_RT_API_BASE_URL = "https://api.koda.trafiklab.se/KoDa/api/v2/gtfs-rt/otraf/
 KODA_STATIC_API_BASE_URL = "https://api.koda.trafiklab.se/KoDa/api/v2/gtfs-static/otraf"
 TRAFIKVERKET_API_URL = "https://api.trafikinfo.trafikverket.se/v2/data.xml"
 
-TRAFIKVERKET_KEY = os.environ.get("TRAFIKVERKET_API_KEY")
+TRAFIKVERKET_API_KEY = os.environ["TRAFIKVERKET_API_KEY"]
 KODA_KEY = os.environ.get("KODA_API_KEY")
 HOPSWORKS_PROJECT = os.environ.get("HOPSWORKS_PROJECT")
 HOPSWORKS_API_KEY = os.environ.get("HOPSWORKS_API_KEY")
@@ -227,12 +227,9 @@ def ingest_koda_rt_data(dates, fs):
             clean_column_names(daily_aggregated_df),
             write_options={"wait_for_job": False}
         )
-        
-        # Discard to free memory
-        del dfs, daily_rt_df, daily_aggregated_df
-        gc.collect()
             
         print(f"Completed ingestion for date: {date_string}\n")
+        return daily_aggregated_df
     
     
 def get_aggregated_temporal_trip_features(rt_df):
@@ -273,10 +270,9 @@ def get_aggregated_temporal_trip_features(rt_df):
 
 # Trafikverket Traffic Data Fetching & Parsing
 def build_situation_query(day_start: str, day_end: str) -> str:
-    """Build XML query for Trafikverket API."""
     return f"""
     <REQUEST>
-      <LOGIN authenticationkey="{TRAFIKVERKET_KEY}" />
+      <LOGIN authenticationkey="{TRAFIKVERKET_API_KEY}" />
       <QUERY objecttype="Situation" schemaversion="1">
         <FILTER>
           <AND>
@@ -287,8 +283,10 @@ def build_situation_query(day_start: str, day_end: str) -> str:
             </OR>
           </AND>
         </FILTER>
+
         <INCLUDE>Id</INCLUDE>
         <INCLUDE>Deleted</INCLUDE>
+
         <INCLUDE>Deviation.Id</INCLUDE>
         <INCLUDE>Deviation.StartTime</INCLUDE>
         <INCLUDE>Deviation.EndTime</INCLUDE>
@@ -302,50 +300,53 @@ def build_situation_query(day_start: str, day_end: str) -> str:
         <INCLUDE>Deviation.MessageType</INCLUDE>
         <INCLUDE>Deviation.SeverityCode</INCLUDE>
         <INCLUDE>Deviation.SeverityText</INCLUDE>
+
       </QUERY>
     </REQUEST>
     """
 
-def fetch_trafikverket_situations(day_start: str, day_end: str) -> ET.Element:
-    """Fetch traffic situations from Trafikverket API with exponential backoff."""
+# Fetch Trafikverket traffic situations
+def fetch_situations(day_start: str, day_end: str) -> ET.Element:
     xml_query = build_situation_query(day_start, day_end)
+
+    response = requests.post(
+        TRAFIKVERKET_API_URL,
+        data=xml_query.encode("utf-8"),
+        headers={"Content-Type": "application/xml"},
+        timeout=60
+    )
     
-    backoff = INITIAL_BACKOFF
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            response = requests.post(
-                TRAFIKVERKET_API_URL,
-                data=xml_query.encode("utf-8"),
-                headers={"Content-Type": "application/xml"},
-                timeout=60
-            )
-            
-            if response.status_code == 200:
-                return ET.fromstring(response.content)
-            else:
-                print(f"  API Error {response.status_code}: {response.text[:200]}")
-                if attempt < MAX_RETRIES:
-                    print(f"  Retrying in {backoff}s (attempt {attempt}/{MAX_RETRIES})...")
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, MAX_BACKOFF)
-                else:
-                    return None
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-            if attempt < MAX_RETRIES:
-                print(f"  Timeout/connection error, retrying in {backoff}s (attempt {attempt}/{MAX_RETRIES})...")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, MAX_BACKOFF)
-            else:
-                print(f"  Failed after {MAX_RETRIES} attempts: {type(e).__name__}")
-                return None
-        except Exception as e:
-            print(f"  Error fetching Trafikverket data: {e}")
-            return None
+    if response.status_code != 200:
+        print(f"API Error {response.status_code}: {response.text}")
+        response.raise_for_status()
     
-    return None
+    return ET.fromstring(response.content)
+
+
+def parse_wkt_centroid(wkt: str):
+    if not wkt:
+        return None, None
+
+    if wkt.startswith("POINT"):
+        lon, lat = map(
+            float,
+            wkt.replace("POINT (", "").replace(")", "").split()
+        )
+        return lat, lon
+
+    if wkt.startswith("LINESTRING"):
+        coords = [
+            tuple(map(float, p.split()))
+            for p in wkt.replace("LINESTRING (", "").replace(")", "").split(",")
+        ]
+        lons = [c[0] for c in coords]
+        lats = [c[1] for c in coords]
+        return np.mean(lats), np.mean(lons)
+
+    return None, None
 
 def extract_geometry_wkt(geometry_el):
-    """Extract WKT geometry from Geometry element."""
+    """Extract WKT geometry from Geometry element, preferring Point > Line > WGS84."""
     if geometry_el is None:
         return None
     
@@ -360,31 +361,26 @@ def extract_geometry_wkt(geometry_el):
     wgs84_simple = geometry_el.find("WGS84")
     return wgs84_simple.text if wgs84_simple is not None else None
 
-def parse_wkt_centroid(wkt: str):
-    """Extract lat/lon centroid from WKT geometry."""
-    if not wkt:
-        return None, None
-
-    if wkt.startswith("POINT"):
-        lon, lat = map(float, wkt.replace("POINT (", "").replace(")", "").split())
-        return lat, lon
-
-    if wkt.startswith("LINESTRING"):
-        coords = [tuple(map(float, p.split())) for p in wkt.replace("LINESTRING (", "").replace(")", "").split(",")]
-        lons = [c[0] for c in coords]
-        lats = [c[1] for c in coords]
-        return np.mean(lats), np.mean(lons)
-
-    return None, None
 
 def extract_deviation_info(dev):
     """Extract deviation information from a Deviation element."""
     if dev is None:
         return {
-            "road_number": None, "road_number_numeric": None, "start_time": None, "end_time": None,
-            "header": None, "message_code": None, "message_type": None, "severity_code": None,
-            "severity_text": None, "location_description": None, "valid_until_further_notice": False,
-            "geometry_wkt": None, "lat": None, "lon": None, "deviation_id": None,
+            "road_number": None,
+            "road_number_numeric": None,
+            "start_time": None,
+            "end_time": None,
+            "header": None,
+            "message_code": None,
+            "message_type": None,
+            "severity_code": None,
+            "severity_text": None,
+            "location_description": None,
+            "valid_until_further_notice": False,
+            "geometry_wkt": None,
+            "lat": None,
+            "lon": None,
+            "deviation_id": None,
         }
     
     road_number = dev.findtext("RoadNumber")
@@ -405,43 +401,114 @@ def extract_deviation_info(dev):
     lat, lon = parse_wkt_centroid(geometry_wkt)
     
     return {
-        "road_number": road_number, "road_number_numeric": road_number_numeric, "start_time": start_time,
-        "end_time": end_time, "header": header, "message_code": message_code, "message_type": message_type,
-        "severity_code": severity_code, "severity_text": severity_text, "location_description": location_description,
-        "valid_until_further_notice": valid_until_further_notice, "geometry_wkt": geometry_wkt,
-        "lat": lat, "lon": lon, "deviation_id": deviation_id,
+        "road_number": road_number,
+        "road_number_numeric": road_number_numeric,
+        "start_time": start_time,
+        "end_time": end_time,
+        "header": header,
+        "message_code": message_code,
+        "message_type": message_type,
+        "severity_code": severity_code,
+        "severity_text": severity_text,
+        "location_description": location_description,
+        "valid_until_further_notice": valid_until_further_notice,
+        "geometry_wkt": geometry_wkt,
+        "lat": lat,
+        "lon": lon,
+        "deviation_id": deviation_id,
     }
 
-def parse_situations(root: ET.Element) -> pd.DataFrame:
-    """Parse XML situations into DataFrame."""
-    if root is None:
-        return pd.DataFrame()
-    
+
+def parse_situations(root: ET.Element, ingestion_date: datetime.date) -> pd.DataFrame:
     rows = []
+    
     for situation in root.findall(".//Situation"):
         situation_id = situation.findtext("Id")
         deleted = situation.findtext("Deleted") == "true"
+
         deviations = situation.findall("Deviation")
-        
         if not deviations:
             deviations = [None]
 
         for dev in deviations:
             dev_info = extract_deviation_info(dev)
+
             rows.append({
-                "event_id": situation_id, "deviation_id": dev_info["deviation_id"],
-                "start_time": dev_info["start_time"], "end_time": dev_info["end_time"],
-                "latitude": dev_info["lat"], "longitude": dev_info["lon"],
-                "geometry_wkt": dev_info["geometry_wkt"], "affected_road": dev_info["road_number"],
+                "event_id": situation_id,
+                "deviation_id": dev_info["deviation_id"],
+                "start_time": dev_info["start_time"],
+                "end_time": dev_info["end_time"],
+                "latitude": dev_info["lat"],
+                "longitude": dev_info["lon"],
+                "geometry_wkt": dev_info["geometry_wkt"],
+                "affected_road": dev_info["road_number"],
                 "road_number_numeric": dev_info["road_number_numeric"],
                 "location_description": dev_info["location_description"],
-                "message_code": dev_info["message_code"], "message_type": dev_info["message_type"],
-                "severity_code": dev_info["severity_code"], "severity_text": dev_info["severity_text"],
-                "header": dev_info["header"], "valid_until_further_notice": dev_info["valid_until_further_notice"],
-                "deleted": deleted, "source": "trafikverket",
+                "message_code": dev_info["message_code"],
+                "message_type": dev_info["message_type"],
+                "severity_code": dev_info["severity_code"],
+                "severity_text": dev_info["severity_text"],
+                "header": dev_info["header"],
+                "valid_until_further_notice": dev_info["valid_until_further_notice"],
+                "deleted": deleted,
+                "source": "trafikverket",
+                "ingestion_date": ingestion_date
             })
 
     return pd.DataFrame(rows)
+
+def ingest_trafikverket_events(dates, project):
+    fs = project.get_feature_store()
+
+    traffic_fg = fs.get_or_create_feature_group(
+        name="trafikverket_traffic_event_fg",
+        version=2,
+        primary_key=["event_id", "deviation_id"],
+        event_time="start_time",
+        online_enabled=False,
+        description="Raw traffic events (Situations/Deviations) from Trafikverket"
+    )
+
+    for date in dates:
+        day_start = date.strftime("%Y-%m-%dT00:00:00")
+        day_end = date.strftime("%Y-%m-%dT23:59:59")
+
+        root = fetch_situations(day_start, day_end)
+        df = parse_situations(root, ingestion_date=date.date())
+
+        if df.empty:
+            print(f"No situations found for {date.date()}")
+            continue
+
+        # Convert to datetime and ensure timezone-aware UTC
+        df["start_time"] = pd.to_datetime(df["start_time"], utc=True)
+        df["end_time"] = pd.to_datetime(df["end_time"], errors="coerce", utc=True)
+
+        # Remove rows with null start_time (required field)
+        df = df.dropna(subset=["start_time"])
+        
+        if df.empty:
+            print(f"No valid situations after filtering for {date.date()}")
+            continue
+        
+        # For missing end_time, use start_time + 1 day (ongoing event)
+        # This ensures we have a valid timestamp instead of NaT
+        missing_end = df["end_time"].isna()
+        df.loc[missing_end, "end_time"] = df.loc[missing_end, "start_time"] + timedelta(days=1)
+
+        # Ensure numeric fields are proper types
+        df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+        df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+        df["road_number_numeric"] = pd.to_numeric(df["road_number_numeric"], errors="coerce")
+        
+        # Convert booleans to proper type
+        df["valid_until_further_notice"] = df["valid_until_further_notice"].astype(bool)
+        df["deleted"] = df["deleted"].astype(bool)
+
+        print(f"Ingesting {len(df)} traffic events for {date.date()}")
+        traffic_fg.insert(df, write_options={"wait_for_job": False})
+        
+        return df
 
 
 # Daily feature ingestion
@@ -468,45 +535,13 @@ def main():
         # Fetch KODA RT vehicle data for all 24 hours
         print(f"Fetching KODA real-time vehicle positions...")
         dates = [yesterday]
-        ingest_koda_rt_data(dates, fs)
+        trip_agg_df = ingest_koda_rt_data(dates, fs)
         
         # Fetch Trafikverket traffic events
         print(f"\nFetching Trafikverket traffic events...")
-        day_start = yesterday_str + "T00:00:00"
-        day_end = yesterday_str + "T23:59:59"
+        dates = [yesterday_ts]
         
-        root = fetch_trafikverket_situations(day_start, day_end)
-        traffic_df = parse_situations(root)
-        
-        if not traffic_df.empty:
-            # Convert timestamps to UTC-aware datetime
-            traffic_df["start_time"] = pd.to_datetime(traffic_df["start_time"], utc=True)
-            traffic_df["end_time"] = pd.to_datetime(traffic_df["end_time"], errors="coerce", utc=True)
-            
-            # Remove rows with null start_time
-            traffic_df = traffic_df.dropna(subset=["start_time"])
-            
-            # Fill missing end_time with start_time + 1 day
-            missing_end = traffic_df["end_time"].isna()
-            traffic_df.loc[missing_end, "end_time"] = traffic_df.loc[missing_end, "start_time"] + timedelta(days=1)
-            
-            # Type conversions
-            traffic_df["latitude"] = pd.to_numeric(traffic_df["latitude"], errors="coerce")
-            traffic_df["longitude"] = pd.to_numeric(traffic_df["longitude"], errors="coerce")
-            traffic_df["road_number_numeric"] = pd.to_numeric(traffic_df["road_number_numeric"], errors="coerce")
-            traffic_df["valid_until_further_notice"] = traffic_df["valid_until_further_notice"].astype(bool)
-            traffic_df["deleted"] = traffic_df["deleted"].astype(bool)
-            
-            print(f"  Fetched {len(traffic_df)} traffic events")
-            
-            # Ingest to trafikverket_traffic_event_fg
-            print(f"  Ingesting to trafikverket_traffic_event_fg...")
-            traffic_fg = fs.get_feature_group(name="trafikverket_traffic_event_fg", version=2)
-            traffic_fg.insert(clean_column_names(traffic_df), write_options={"wait_for_job": False})
-            print(f"  Ingested {len(traffic_df)} records to trafikverket_traffic_event_fg")
-        else:
-            print(f"  No traffic events found for {yesterday.date()}")
-            traffic_df = pd.DataFrame()
+        traffic_df = ingest_trafikverket_events(dates, project)
         
         # Create enriched features combining trip + traffic
         print(f"\nCreating enriched features...")
