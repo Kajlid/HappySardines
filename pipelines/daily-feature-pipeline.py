@@ -159,8 +159,7 @@ def fetch_koda_static_data(date_str: str, tmp_dir: str) -> str:
         print(f"  Error downloading static data: {e}")
         return None
 
-def ingest_koda_rt_data(dates, project):
-    fs = project.get_feature_store()
+def ingest_koda_rt_data(dates, fs):
     print(dates)
     
     # Data expectations
@@ -468,34 +467,8 @@ def main():
     try:
         # Fetch KODA RT vehicle data for all 24 hours
         print(f"Fetching KODA real-time vehicle positions...")
-        for hour in range(24):
-            print(f"  Fetching hour {hour}...")
-            content = fetch_koda_rt_data(yesterday_str, hour)
-            if content:
-                rows = parse_vehiclepositions(content, yesterday_str, hour)
-                rt_rows_all.extend(rows)
-        
-        if not rt_rows_all:
-            print("  No RT data fetched. Exiting.")
-            return
-        
-        rt_df = pd.DataFrame(rt_rows_all)
-        rt_df["timestamp"] = pd.to_datetime(rt_df["timestamp"], utc=True)
-        rt_df = rt_df[rt_df['trip_id'].notna() & rt_df['vehicle_id'].notna()]
-        
-        # Aggregate to 1-minute windows
-        trip_agg_df = get_aggregated_temporal_trip_features(rt_df)
-        if trip_agg_df.empty:
-            print("   No aggregated data after processing. Exiting.")
-            return
-        
-        print(f"    Fetched and aggregated {len(trip_agg_df)} trip windows")
-        
-        # Ingest to vehicle_trip_agg_fg
-        print(f"  Ingesting to vehicle_trip_agg_fg...")
-        vehicle_fg = fs.get_feature_group(name="vehicle_trip_agg_fg", version=2)
-        vehicle_fg.insert(clean_column_names(trip_agg_df), write_options={"wait_for_job": False})
-        print(f"  Ingested {len(trip_agg_df)} records to vehicle_trip_agg_fg")
+        dates = [yesterday]
+        ingest_koda_rt_data(dates, fs)
         
         # Fetch Trafikverket traffic events
         print(f"\nFetching Trafikverket traffic events...")
