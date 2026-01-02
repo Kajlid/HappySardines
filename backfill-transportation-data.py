@@ -548,7 +548,7 @@ def main():
     # start_date = datetime.now() - timedelta(days=30)  # 1 month
     # end_date = datetime.now() - timedelta(days=1)     # yesterday
     
-    start_date = datetime.strptime("2025-12-16", "%Y-%m-%d").strftime("%d-%m-%Y")
+    start_date = datetime.strptime("2025-12-31", "%Y-%m-%d").strftime("%d-%m-%Y")
     print(start_date)
     end_date = datetime.now() - timedelta(days=1)
     
