@@ -40,6 +40,10 @@ def build_situation_query(day_start: str, day_end: str) -> str:
         <INCLUDE>Deviation.LocationDescriptor</INCLUDE>
         <INCLUDE>Deviation.RoadNumber</INCLUDE>
         <INCLUDE>Deviation.RoadNumberNumeric</INCLUDE>
+        <INCLUDE>Deviation.MessageCode</INCLUDE>
+        <INCLUDE>Deviation.MessageType</INCLUDE>
+        <INCLUDE>Deviation.SeverityCode</INCLUDE>
+        <INCLUDE>Deviation.SeverityText</INCLUDE>
 
       </QUERY>
     </REQUEST>
@@ -111,6 +115,10 @@ def extract_deviation_info(dev):
             "start_time": None,
             "end_time": None,
             "header": None,
+            "message_code": None,
+            "message_type": None,
+            "severity_code": None,
+            "severity_text": None,
             "location_description": None,
             "valid_until_further_notice": False,
             "geometry_wkt": None,
@@ -127,6 +135,10 @@ def extract_deviation_info(dev):
     location_description = dev.findtext("LocationDescriptor")
     valid_until_further_notice = dev.findtext("ValidUntilFurtherNotice") == "true"
     deviation_id = dev.findtext("Id")
+    message_code = dev.findtext("MessageCode")
+    message_type = dev.findtext("MessageType")
+    severity_code = dev.findtext("SeverityCode")
+    severity_text = dev.findtext("SeverityText")
     
     geometry_el = dev.find("Geometry")
     geometry_wkt = extract_geometry_wkt(geometry_el)
@@ -138,6 +150,10 @@ def extract_deviation_info(dev):
         "start_time": start_time,
         "end_time": end_time,
         "header": header,
+        "message_code": message_code,
+        "message_type": message_type,
+        "severity_code": severity_code,
+        "severity_text": severity_text,
         "location_description": location_description,
         "valid_until_further_notice": valid_until_further_notice,
         "geometry_wkt": geometry_wkt,
@@ -172,6 +188,10 @@ def parse_situations(root: ET.Element, ingestion_date: datetime.date) -> pd.Data
                 "affected_road": dev_info["road_number"],
                 "road_number_numeric": dev_info["road_number_numeric"],
                 "location_description": dev_info["location_description"],
+                "message_code": dev_info["message_code"],
+                "message_type": dev_info["message_type"],
+                "severity_code": dev_info["severity_code"],
+                "severity_text": dev_info["severity_text"],
                 "header": dev_info["header"],
                 "valid_until_further_notice": dev_info["valid_until_further_notice"],
                 "deleted": deleted,
@@ -186,7 +206,7 @@ def ingest_trafikverket_events(dates, project):
 
     traffic_fg = fs.get_or_create_feature_group(
         name="trafikverket_traffic_event_fg",
-        version=1,
+        version=2,
         primary_key=["event_id", "deviation_id"],
         event_time="start_time",
         online_enabled=False,
@@ -241,7 +261,7 @@ def main():
     
     # Parse date range
     start_date = datetime.strptime("2025-11-01", "%Y-%m-%d")
-    end_date = datetime.strptime("2025-12-15", "%Y-%m-%d")
+    end_date = datetime.strptime("2025-12-31", "%Y-%m-%d")
     
     # Convert to UTC-aware timestamps for comparison with trip data
     start_date = pd.Timestamp(start_date, tz='UTC')
