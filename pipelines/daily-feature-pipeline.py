@@ -223,10 +223,26 @@ def ingest_koda_rt_data(dates, fs):
         # Data validation before ingestion
         validate_with_expectations(daily_aggregated_df, agg_expectation_suite, name="Aggregated vehicle features")
         
-        vehicle_trip_agg_fg.insert(
-            clean_column_names(daily_aggregated_df),
-            write_options={"wait_for_job": False}
-        )
+        # Retry insert with backoff for transient Hopsworks errors
+        insert_retries = 0
+        while insert_retries < 3:
+            try:
+                vehicle_trip_agg_fg.insert(
+                    clean_column_names(daily_aggregated_df),
+                    write_options={"wait_for_job": False}
+                )
+                print(f"Ingested {len(daily_aggregated_df)} records to vehicle_trip_agg_fg")
+                break
+            except Exception as e:
+                insert_retries += 1
+                if insert_retries < 3:
+                    backoff = INITIAL_BACKOFF * (2 ** (insert_retries - 1))
+                    print(f"KODA insert failed: {e}")
+                    print(f"Retrying in {backoff}s (attempt {insert_retries}/3)...")
+                    time.sleep(backoff)
+                else:
+                    print(f"KODA insert failed after 3 retries: {e}")
+                    raise
             
         print(f"Completed ingestion for date: {date_string}\n")
         return daily_aggregated_df
@@ -608,6 +624,7 @@ def main():
             description="Daily enriched trip features with vehicle metrics and nearby traffic events"
         )
         
+        # Standardize column names
         enriched_df.columns = (
             enriched_df.columns
             .str.strip()
@@ -615,8 +632,45 @@ def main():
             .str.replace(" ", "_")
         )
         
-        enriched_fg.insert(clean_column_names(enriched_df), write_options={"wait_for_job": False})
-        print(f"  Ingested {len(enriched_df)} enriched records to trip_occupancy_features_daily")
+        # Ensure numeric columns have proper dtypes to avoid Delta Lake serialization issues
+        for col in enriched_df.columns:
+            if enriched_df[col].dtype == 'object':
+                # Try to convert numeric-looking strings
+                try:
+                    converted = pd.to_numeric(enriched_df[col], errors='coerce')
+                    if converted.notna().sum() > enriched_df[col].notna().sum() * 0.5:
+                        enriched_df[col] = converted
+                except (ValueError, TypeError):
+                    pass
+        
+        # Ensure booleans are proper type
+        for col in ['has_nearby_event']:
+            if col in enriched_df.columns:
+                enriched_df[col] = enriched_df[col].astype('int32')
+        
+        # Replace NaN with None for consistency
+        enriched_df = enriched_df.where(pd.notna(enriched_df), None)
+        
+        print(f"  DataFrame dtypes before insert:")
+        print(enriched_df.dtypes)
+        
+        # Retry insert with backoff for transient Hopsworks errors
+        insert_retries = 0
+        while insert_retries < 3:
+            try:
+                enriched_fg.insert(clean_column_names(enriched_df), write_options={"wait_for_job": False})
+                print(f"  Ingested {len(enriched_df)} enriched records to trip_occupancy_features_daily")
+                break
+            except Exception as e:
+                insert_retries += 1
+                if insert_retries < 3:
+                    backoff = INITIAL_BACKOFF * (2 ** (insert_retries - 1))
+                    print(f"  Insert failed: {e}")
+                    print(f"  Retrying in {backoff}s (attempt {insert_retries}/3)...")
+                    time.sleep(backoff)
+                else:
+                    print(f"  Insert failed after 3 retries: {e}")
+                    raise
         
         print(f"\n{'='*70}")
         print(f"Daily feature pipeline completed successfully for {yesterday.date()}")
