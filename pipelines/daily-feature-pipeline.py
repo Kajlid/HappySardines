@@ -281,6 +281,9 @@ def get_aggregated_temporal_trip_features(rt_df):
     vehicle_trip_1min_df["hour"] = vehicle_trip_1min_df["window_start"].dt.hour
     vehicle_trip_1min_df["day_of_week"] = vehicle_trip_1min_df["window_start"].dt.weekday
     vehicle_trip_1min_df["window_start"] = pd.to_datetime(vehicle_trip_1min_df["window_start"])
+    
+    # Ensure trip_id is string type
+    vehicle_trip_1min_df['trip_id'] = vehicle_trip_1min_df['trip_id'].astype(str)
 
     return vehicle_trip_1min_df
 
@@ -562,6 +565,9 @@ def main():
         # Create enriched features combining trip + traffic
         print(f"\nCreating enriched features...")
         
+        # Remove rows with null trip_id or window_start (primary keys)
+        trip_agg_df = trip_agg_df[trip_agg_df['trip_id'].notna()]
+        
         if traffic_df.empty:
             enriched_df = trip_agg_df.copy()
             enriched_df["has_nearby_event"] = 0
@@ -651,8 +657,16 @@ def main():
         # Replace NaN with None for consistency
         enriched_df = enriched_df.where(pd.notna(enriched_df), None)
         
+        # Ensure primary key column (trip_id) are strings and non-null
+        enriched_df['trip_id'] = enriched_df['trip_id'].astype(str)
+        
+        # Drop any rows with null primary keys
+        enriched_df = enriched_df[enriched_df['trip_id'] != 'nan']
+        enriched_df = enriched_df[enriched_df['trip_id'].notna()]
+        
         print(f"  DataFrame dtypes before insert:")
         print(enriched_df.dtypes)
+        print(f"  Rows with null trip_id: {enriched_df['trip_id'].isna().sum()}")
         
         # Retry insert with backoff for transient Hopsworks errors
         insert_retries = 0
