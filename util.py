@@ -29,11 +29,14 @@ HOURLY_WEATHER_VARIABLES = [
     "weather_code",
 ]
 
+# Svenska Dagar API for Swedish holidays
+SVENSKA_DAGAR_API_URL = "https://sholiday.faboul.se/dagar/v2.1"
+
 def fetch_json(url):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.get(url, timeout=60)
-            resp.raise_for_status()  
+            resp.raise_for_status()
             return resp.json()
         except requests.exceptions.RequestException as e:
             print(f"Attempt {attempt} failed: {e}")
@@ -47,7 +50,7 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     """Remove whitespaces in beginning of column names to make sure they are compatible with Hopsworks"""
     df.columns = (
         df.columns
-        .str.strip()            
+        .str.strip()
         .str.lower()            # lowercase everything
         .str.replace(" ", "_")  # replace spaces with underscores
     )
@@ -56,13 +59,13 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
         col if col[0].isalpha() else f"f_{col.lstrip('_')}"
         for col in df.columns
     ]
-    return df     
+    return df
 
 def distance_m(lat1, lon1, lat2, lon2):
     """Calculate distance in meters between two points."""
-    return haversine((lat1, lon1), (lat2, lon2), unit=Unit.METERS)   
+    return haversine((lat1, lon1), (lat2, lon2), unit=Unit.METERS)
 
-# For Trafikverket situation data           
+# For Trafikverket situation data
 def build_situation_query(day_start: str, day_end: str, api_key: str) -> str:
     return f"""
     <REQUEST>
@@ -109,11 +112,11 @@ def fetch_situations(day_start: str, day_end: str, url:str, api_key:str) -> ET.E
         headers={"Content-Type": "application/xml"},
         timeout=60
     )
-    
+
     if response.status_code != 200:
         print(f"API Error {response.status_code}: {response.text}")
         response.raise_for_status()
-    
+
     return ET.fromstring(response.content)
 
 
@@ -130,8 +133,8 @@ def fetch_historical_weather(
     Args:
         start_date: Start date in YYYY-MM-DD format
         end_date: End date in YYYY-MM-DD format
-        latitude: Location latitude (default: Linköping)
-        longitude: Location longitude (default: Linköping)
+        latitude: Location latitude (default: Östergötland centroid)
+        longitude: Location longitude (default: Östergötland centroid)
 
     Returns:
         DataFrame with hourly weather data
@@ -223,3 +226,99 @@ def _parse_weather_response(data: dict, latitude: float, longitude: float) -> pd
     )
 
     return df
+
+
+# Swedish holiday data functions
+def fetch_swedish_holidays(year: int, month: int = None) -> pd.DataFrame:
+    """
+    Fetch Swedish holiday data from Svenska Dagar API.
+
+    Args:
+        year: Year to fetch (e.g., 2025)
+        month: Optional month (1-12). If None, fetches entire year.
+
+    Returns:
+        DataFrame with daily holiday information
+    """
+    if month:
+        url = f"{SVENSKA_DAGAR_API_URL}/{year}/{month:02d}"
+    else:
+        url = f"{SVENSKA_DAGAR_API_URL}/{year}"
+
+    response = requests.get(url, timeout=30)
+
+    if response.status_code != 200:
+        print(f"Svenska Dagar API Error {response.status_code}: {response.text[:200]}")
+        response.raise_for_status()
+
+    data = response.json()
+    days = data.get("dagar", [])
+
+    if not days:
+        return pd.DataFrame()
+
+    rows = []
+    for day in days:
+        rows.append({
+            "date": day.get("datum"),
+            "weekday": day.get("veckodag"),
+            "week": int(day.get("vecka", 0)),
+            "day_of_week": int(day.get("dag i vecka", 0)),
+            "is_work_free": day.get("arbetsfri dag") == "Ja",
+            "is_red_day": day.get("röd dag") == "Ja",
+            "is_day_before_holiday": day.get("dag före arbetsfri helgdag") == "Ja",
+            "holiday_name": day.get("helgdag"),
+            "flag_day": day.get("flaggdag"),
+        })
+
+    df = pd.DataFrame(rows)
+    df["date"] = pd.to_datetime(df["date"])
+
+    return df
+
+
+def get_holiday_features_for_date(date: datetime) -> dict:
+    """
+    Get holiday features for a specific date.
+
+    Args:
+        date: Date to get features for
+
+    Returns:
+        Dictionary with holiday features
+    """
+    url = f"{SVENSKA_DAGAR_API_URL}/{date.year}/{date.month:02d}/{date.day:02d}"
+
+    try:
+        response = requests.get(url, timeout=30)
+        if response.status_code != 200:
+            return _empty_holiday_features()
+
+        data = response.json()
+        days = data.get("dagar", [])
+
+        if not days:
+            return _empty_holiday_features()
+
+        day = days[0]
+        return {
+            "is_work_free": day.get("arbetsfri dag") == "Ja",
+            "is_red_day": day.get("röd dag") == "Ja",
+            "is_day_before_holiday": day.get("dag före arbetsfri helgdag") == "Ja",
+            "is_holiday": day.get("helgdag") is not None,
+            "holiday_name": day.get("helgdag"),
+        }
+    except Exception as e:
+        print(f"Error fetching holiday data: {e}")
+        return _empty_holiday_features()
+
+
+def _empty_holiday_features() -> dict:
+    """Return empty holiday features dict."""
+    return {
+        "is_work_free": False,
+        "is_red_day": False,
+        "is_day_before_holiday": False,
+        "is_holiday": False,
+        "holiday_name": None,
+    }
