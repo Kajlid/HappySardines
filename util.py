@@ -3,9 +3,31 @@ import time
 import xml.etree.ElementTree as ET
 import pandas as pd
 from haversine import haversine, Unit
+from datetime import datetime, timedelta
 
 MAX_RETRIES = 3
 WAIT_SECONDS = 5  # wait between retries
+
+# Open-Meteo API endpoints
+OPENMETEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+OPENMETEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+# Östergötland region center (centroid of otraf GTFS stops)
+DEFAULT_WEATHER_LAT = 58.13
+DEFAULT_WEATHER_LON = 15.90
+
+# Weather variables to fetch
+HOURLY_WEATHER_VARIABLES = [
+    "temperature_2m",
+    "relative_humidity_2m",
+    "precipitation",
+    "rain",
+    "snowfall",
+    "cloud_cover",
+    "wind_speed_10m",
+    "wind_gusts_10m",
+    "weather_code",
+]
 
 def fetch_json(url):
     for attempt in range(1, MAX_RETRIES + 1):
@@ -93,3 +115,111 @@ def fetch_situations(day_start: str, day_end: str, url:str, api_key:str) -> ET.E
         response.raise_for_status()
     
     return ET.fromstring(response.content)
+
+
+# Weather data functions
+def fetch_historical_weather(
+    start_date: str,
+    end_date: str,
+    latitude: float = DEFAULT_WEATHER_LAT,
+    longitude: float = DEFAULT_WEATHER_LON
+) -> pd.DataFrame:
+    """
+    Fetch historical weather data from Open-Meteo Archive API.
+
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+        latitude: Location latitude (default: Linköping)
+        longitude: Location longitude (default: Linköping)
+
+    Returns:
+        DataFrame with hourly weather data
+    """
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start_date,
+        "end_date": end_date,
+        "hourly": ",".join(HOURLY_WEATHER_VARIABLES),
+        "timezone": "Europe/Stockholm",
+    }
+
+    response = requests.get(OPENMETEO_ARCHIVE_URL, params=params, timeout=60)
+
+    if response.status_code != 200:
+        print(f"Weather API Error {response.status_code}: {response.text[:500]}")
+        response.raise_for_status()
+
+    return _parse_weather_response(response.json(), latitude, longitude)
+
+
+def fetch_weather_forecast(
+    latitude: float = DEFAULT_WEATHER_LAT,
+    longitude: float = DEFAULT_WEATHER_LON,
+    past_days: int = 1,
+    forecast_days: int = 7
+) -> pd.DataFrame:
+    """
+    Fetch weather forecast (and recent past) from Open-Meteo Forecast API.
+
+    Args:
+        latitude: Location latitude
+        longitude: Location longitude
+        past_days: Number of past days to include (max 92)
+        forecast_days: Number of forecast days (max 16)
+
+    Returns:
+        DataFrame with hourly weather data
+    """
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "hourly": ",".join(HOURLY_WEATHER_VARIABLES),
+        "timezone": "Europe/Stockholm",
+        "past_days": past_days,
+        "forecast_days": forecast_days,
+    }
+
+    response = requests.get(OPENMETEO_FORECAST_URL, params=params, timeout=60)
+
+    if response.status_code != 200:
+        print(f"Weather API Error {response.status_code}: {response.text[:500]}")
+        response.raise_for_status()
+
+    return _parse_weather_response(response.json(), latitude, longitude)
+
+
+def _parse_weather_response(data: dict, latitude: float, longitude: float) -> pd.DataFrame:
+    """Parse Open-Meteo API response into DataFrame."""
+    hourly = data.get("hourly", {})
+
+    if not hourly:
+        return pd.DataFrame()
+
+    df = pd.DataFrame({
+        "timestamp": pd.to_datetime(hourly["time"]),
+        "temperature_2m": hourly.get("temperature_2m"),
+        "relative_humidity_2m": hourly.get("relative_humidity_2m"),
+        "precipitation": hourly.get("precipitation"),
+        "rain": hourly.get("rain"),
+        "snowfall": hourly.get("snowfall"),
+        "cloud_cover": hourly.get("cloud_cover"),
+        "wind_speed_10m": hourly.get("wind_speed_10m"),
+        "wind_gusts_10m": hourly.get("wind_gusts_10m"),
+        "weather_code": hourly.get("weather_code"),
+    })
+
+    df["latitude"] = latitude
+    df["longitude"] = longitude
+    df["date"] = df["timestamp"].dt.date
+    df["hour"] = df["timestamp"].dt.hour
+
+    # Make timezone-aware (UTC for Hopsworks)
+    df["timestamp"] = (
+        pd.to_datetime(df["timestamp"])
+        .dt.tz_localize("Europe/Stockholm")
+        .dt.tz_convert("UTC")
+    )
+
+    return df

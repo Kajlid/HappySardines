@@ -392,7 +392,35 @@ def main():
             print(f"  No traffic events found for {yesterday.date()}")
             traffic_df = pd.DataFrame()
         
-        # Create enriched features combining trip + traffic
+        # Fetch weather data for yesterday
+        print(f"\nFetching weather data...")
+        try:
+            weather_df = fetch_weather_forecast(past_days=2, forecast_days=0)
+            # Filter to just yesterday
+            weather_df = weather_df[weather_df["date"] == yesterday.date()]
+
+            if not weather_df.empty:
+                print(f"  Fetched {len(weather_df)} hourly weather records")
+
+                # Ingest to weather feature group
+                weather_fg = fs.get_or_create_feature_group(
+                    name="weather_hourly_fg",
+                    version=1,
+                    primary_key=["timestamp", "latitude", "longitude"],
+                    event_time="timestamp",
+                    online_enabled=False,
+                    description="Hourly weather data from Open-Meteo for Östergötland region"
+                )
+                weather_fg.insert(clean_column_names(weather_df.copy()), write_options={"wait_for_job": False})
+                print(f"  Ingested weather data to weather_hourly_fg")
+            else:
+                print(f"  No weather data available for {yesterday.date()}")
+                weather_df = pd.DataFrame()
+        except Exception as e:
+            print(f"  Warning: Could not fetch weather data: {e}")
+            weather_df = pd.DataFrame()
+
+        # Create enriched features combining trip + traffic + weather
         print(f"\nCreating enriched features...")
         
         if traffic_df.empty:
@@ -445,7 +473,26 @@ def main():
             
             enriched_features = pd.DataFrame(enriched_data)
             enriched_df = pd.concat([trip_agg_df.reset_index(drop=True), enriched_features], axis=1)
-        
+
+        # Add weather features by joining on hour
+        if not weather_df.empty:
+            print(f"  Adding weather features...")
+            weather_hourly = weather_df[["hour", "temperature_2m", "precipitation", "rain",
+                                          "snowfall", "cloud_cover", "wind_speed_10m", "weather_code"]].copy()
+            weather_hourly = weather_hourly.drop_duplicates(subset=["hour"])
+
+            enriched_df = enriched_df.merge(weather_hourly, on="hour", how="left")
+            print(f"  Added weather features: temperature, precipitation, cloud_cover, wind_speed, etc.")
+        else:
+            # Add empty weather columns if no weather data
+            enriched_df["temperature_2m"] = None
+            enriched_df["precipitation"] = None
+            enriched_df["rain"] = None
+            enriched_df["snowfall"] = None
+            enriched_df["cloud_cover"] = None
+            enriched_df["wind_speed_10m"] = None
+            enriched_df["weather_code"] = None
+
         # Ingest to combined feature group
         print(f"  Creating/updating trip_occupancy_features_daily...")
         enriched_fg = fs.get_or_create_feature_group(
@@ -454,7 +501,7 @@ def main():
             primary_key=["trip_id", "window_start"],
             event_time="window_start",
             online_enabled=False,
-            description="Daily enriched trip features with vehicle metrics and nearby traffic events"
+            description="Daily enriched trip features with vehicle metrics, nearby traffic events, and weather"
         )
         
         enriched_df.columns = (
