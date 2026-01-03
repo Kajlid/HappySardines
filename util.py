@@ -12,9 +12,9 @@ WAIT_SECONDS = 5  # wait between retries
 OPENMETEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPENMETEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
-# Östergötland region center (Linköping area - where otraf operates)
-DEFAULT_WEATHER_LAT = 58.41
-DEFAULT_WEATHER_LON = 15.62
+# Östergötland region center (centroid of otraf GTFS stops)
+DEFAULT_WEATHER_LAT = 58.13
+DEFAULT_WEATHER_LON = 15.90
 
 # Weather variables to fetch
 HOURLY_WEATHER_VARIABLES = [

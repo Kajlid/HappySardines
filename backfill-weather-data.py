@@ -110,6 +110,7 @@ def main():
 
     print(f"\nBackfilling weather data from {start_date} to {end_date}")
     print(f"Location: Östergötland region (lat={DEFAULT_WEATHER_LAT}, lon={DEFAULT_WEATHER_LON})")
+    print(f"(Coordinates based on centroid of otraf GTFS stops)")
     print("=" * 60)
 
     ingest_weather_data(start_date, end_date, project)
