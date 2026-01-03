@@ -21,7 +21,13 @@ parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from util import clean_column_names, distance_m, validate_with_expectations
+from util import (
+    clean_column_names,
+    distance_m,
+    validate_with_expectations,
+    fetch_weather_forecast,
+    get_holiday_features_for_date,
+)
 
 load_dotenv()
 
@@ -92,59 +98,57 @@ def parse_vehiclepositions(content: bytes, date: str, hour: int):
 # Every hour, we fetch new data from the real-time API
 def fetch_koda_rt_data(date, hour):
     url = f"{KODA_RT_API_BASE_URL}?date={date}&hour={hour}&key={os.environ['KODA_API_KEY']}"
-    
+
     print(f"Checking RT data for date: {date}, hour: {hour}")
 
     rows = []
     try:
         response = requests.get(url, stream=True)
         print(f"HTTP {response.status_code} response received.")
-        
+
         if response.status_code == 200 and response.content:
-            
+
             # Save 7z to a temporary file
             with tempfile.NamedTemporaryFile(suffix=".7z") as tmp_7z:
                 tmp_7z.write(response.content)
                 tmp_7z_path = tmp_7z.name
-                
+
                 # Extract protobuf(s) from 7z
                 with tempfile.TemporaryDirectory() as tmp_dir:
                     with py7zr.SevenZipFile(tmp_7z.name, mode='r') as archive:
                         archive.extractall(path=tmp_dir)
                         all_files = archive.getnames()  # lists all files including paths
-                        # print("Files in archive:", all_files)
                         for rel_path in all_files:
                             if rel_path.endswith(".pb"):
                                 file_path = os.path.join(tmp_dir, rel_path)
-                                # print("Processing:", file_path, "Size:", os.path.getsize(file_path))
                                 with open(file_path, "rb") as f:
                                     content = f.read()  # raw protobuf binary
                                     try:
                                         rows.extend(parse_vehiclepositions(content, date, hour))
                                     except Exception as e:
                                         print(f"Failed to parse protobuf {rel_path}: {e}")
-                                    
-                # os.remove(tmp_7z_path)
+
                 print(f"Hour {hour}: {len(rows)} vehicle positions parsed")
                 return rows
-                
-        
+
+
         else:
             print("No data to save.")
             return []
 
-        
+
     except Exception as e:
         print(f"Error fetching RT data: {e}")
+        return []
 
 def fetch_koda_static_data(date_str: str, tmp_dir: str) -> str:
     """Download GTFS static ZIP file from KODA API."""
     url = f"{KODA_STATIC_API_BASE_URL}?date={date_str}&key={KODA_KEY}"
     zip_path = os.path.join(tmp_dir, f"gtfs_static_{date_str.replace('-', '_')}.zip")
-    
+
     if os.path.exists(zip_path):
         return zip_path
-    
+
     try:
         response = requests.get(url, stream=True, timeout=60)
         if response.status_code == 200 and "application/zip" in response.headers.get("Content-Type", ""):
@@ -161,7 +165,7 @@ def fetch_koda_static_data(date_str: str, tmp_dir: str) -> str:
 
 def ingest_koda_rt_data(dates, fs):
     print(dates)
-    
+
     # Data expectations
     agg_expectation_suite = ge.core.ExpectationSuite(
         expectation_suite_name="agg_expectation_suite"
@@ -174,10 +178,10 @@ def ingest_koda_rt_data(dates, fs):
                 kwargs={"column": col}
             )
         )
-    
+
     # For model to predict occupancy on aggregated features
     vehicle_trip_agg_fg = fs.get_or_create_feature_group(
-        name="vehicle_trip_agg_fg",  
+        name="vehicle_trip_agg_fg",
         version=2,
         primary_key=["trip_id", "window_start"],
         event_time="window_start",
@@ -185,7 +189,7 @@ def ingest_koda_rt_data(dates, fs):
         expectation_suite=agg_expectation_suite,
         online_enabled=False
     )
-    
+
     for date in dates:
         date_string = datetime.strftime(date, "%Y-%m-%d")
         dfs = []
@@ -194,22 +198,22 @@ def ingest_koda_rt_data(dates, fs):
             rows = fetch_koda_rt_data(date_string, hour)
             if not rows:
                 continue
-            
+
             print(f"Fetched {len(rows)} rows")
             rt_df = pd.DataFrame(rows)
             rt_df = rt_df.loc[:, ~rt_df.columns.duplicated()]
 
             dfs.append(clean_column_names(rt_df))
-        
+
         if not dfs:
             continue
-        
+
         daily_rt_df = pd.concat(dfs, ignore_index=True)
-        
+
         # Remove any duplicated columns (by name)
         daily_rt_df = daily_rt_df.loc[:, ~daily_rt_df.columns.duplicated()]
         print("big_df columns:", daily_rt_df.columns)
-        
+
         # Now create window_start once, for the whole day
         daily_rt_df['timestamp'] = pd.to_datetime(daily_rt_df['timestamp'], unit='s', utc=True) # to_datetime assumes nanoseconds by default
 
@@ -219,10 +223,10 @@ def ingest_koda_rt_data(dates, fs):
         daily_aggregated_df = get_aggregated_temporal_trip_features(daily_rt_df)
         # Drop duplicates in the key columns
         daily_aggregated_df = daily_aggregated_df.drop_duplicates(subset=["trip_id", "window_start"], keep="last")
-        
+
         # Data validation before ingestion
         validate_with_expectations(daily_aggregated_df, agg_expectation_suite, name="Aggregated vehicle features")
-        
+
         # Retry insert with backoff for transient Hopsworks errors
         insert_retries = 0
         while insert_retries < 3:
@@ -243,17 +247,21 @@ def ingest_koda_rt_data(dates, fs):
                 else:
                     print(f"KODA insert failed after 3 retries: {e}")
                     raise
-            
+
         print(f"Completed ingestion for date: {date_string}\n")
         return daily_aggregated_df
-    
-    
+
+
 def get_aggregated_temporal_trip_features(rt_df):
-    rt_df = rt_df.sort_values(["timestamp", "trip_id", "vehicle_id"])  
+    """Aggregate real-time vehicle data into 1-minute windows."""
+    if rt_df.empty:
+        return pd.DataFrame()
+
+    rt_df = rt_df.sort_values(["timestamp", "trip_id", "vehicle_id"])
     rt_df['window_start'] = rt_df['timestamp'].dt.floor('1min')    # create windows of a minute
-    
+
     print("rt_df columns: ", rt_df.columns)
-    
+
     vehicle_trip_1min_df = (
         rt_df
         .groupby(["trip_id", "window_start"], as_index=False)
@@ -276,12 +284,12 @@ def get_aggregated_temporal_trip_features(rt_df):
                             lambda x: x.mode().iloc[0] if not x.mode().empty else None)
         )
     )
-    
+
     vehicle_trip_1min_df["date"] = vehicle_trip_1min_df["window_start"].dt.date
     vehicle_trip_1min_df["hour"] = vehicle_trip_1min_df["window_start"].dt.hour
     vehicle_trip_1min_df["day_of_week"] = vehicle_trip_1min_df["window_start"].dt.weekday
     vehicle_trip_1min_df["window_start"] = pd.to_datetime(vehicle_trip_1min_df["window_start"])
-    
+
     # Ensure trip_id is string type
     vehicle_trip_1min_df['trip_id'] = vehicle_trip_1min_df['trip_id'].astype(str)
 
@@ -328,18 +336,22 @@ def build_situation_query(day_start: str, day_end: str) -> str:
 def fetch_situations(day_start: str, day_end: str) -> ET.Element:
     xml_query = build_situation_query(day_start, day_end)
 
-    response = requests.post(
-        TRAFIKVERKET_API_URL,
-        data=xml_query.encode("utf-8"),
-        headers={"Content-Type": "application/xml"},
-        timeout=60
-    )
-    
-    if response.status_code != 200:
-        print(f"API Error {response.status_code}: {response.text}")
-        response.raise_for_status()
-    
-    return ET.fromstring(response.content)
+    try:
+        response = requests.post(
+            TRAFIKVERKET_API_URL,
+            data=xml_query.encode("utf-8"),
+            headers={"Content-Type": "application/xml"},
+            timeout=60
+        )
+
+        if response.status_code != 200:
+            print(f"API Error {response.status_code}: {response.text[:200]}")
+            return None
+
+        return ET.fromstring(response.content)
+    except Exception as e:
+        print(f"  Error fetching Trafikverket data: {e}")
+        return None
 
 
 def parse_wkt_centroid(wkt: str):
@@ -368,15 +380,15 @@ def extract_geometry_wkt(geometry_el):
     """Extract WKT geometry from Geometry element, preferring Point > Line > WGS84."""
     if geometry_el is None:
         return None
-    
+
     wgs84_point = geometry_el.find("Point/WGS84")
     if wgs84_point is not None:
         return wgs84_point.text
-    
+
     wgs84_line = geometry_el.find("Line/WGS84")
     if wgs84_line is not None:
         return wgs84_line.text
-    
+
     wgs84_simple = geometry_el.find("WGS84")
     return wgs84_simple.text if wgs84_simple is not None else None
 
@@ -401,7 +413,7 @@ def extract_deviation_info(dev):
             "lon": None,
             "deviation_id": None,
         }
-    
+
     road_number = dev.findtext("RoadNumber")
     road_number_numeric = dev.findtext("RoadNumberNumeric")
     start_time = dev.findtext("StartTime")
@@ -414,11 +426,11 @@ def extract_deviation_info(dev):
     message_type = dev.findtext("MessageType")
     severity_code = dev.findtext("SeverityCode")
     severity_text = dev.findtext("SeverityText")
-    
+
     geometry_el = dev.find("Geometry")
     geometry_wkt = extract_geometry_wkt(geometry_el)
     lat, lon = parse_wkt_centroid(geometry_wkt)
-    
+
     return {
         "road_number": road_number,
         "road_number_numeric": road_number_numeric,
@@ -439,13 +451,18 @@ def extract_deviation_info(dev):
 
 
 def parse_situations(root: ET.Element, ingestion_date: datetime.date) -> pd.DataFrame:
+    """Parse XML situations into DataFrame."""
+    if root is None:
+        return pd.DataFrame()
+
     rows = []
-    
+
     for situation in root.findall(".//Situation"):
         situation_id = situation.findtext("Id")
         deleted = situation.findtext("Deleted") == "true"
 
         deviations = situation.findall("Deviation")
+
         if not deviations:
             deviations = [None]
 
@@ -505,11 +522,11 @@ def ingest_trafikverket_events(dates, project):
 
         # Remove rows with null start_time (required field)
         df = df.dropna(subset=["start_time"])
-        
+
         if df.empty:
             print(f"No valid situations after filtering for {date.date()}")
             continue
-        
+
         # For missing end_time, use start_time + 1 day (ongoing event)
         # This ensures we have a valid timestamp instead of NaT
         missing_end = df["end_time"].isna()
@@ -519,14 +536,14 @@ def ingest_trafikverket_events(dates, project):
         df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
         df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
         df["road_number_numeric"] = pd.to_numeric(df["road_number_numeric"], errors="coerce")
-        
+
         # Convert booleans to proper type
         df["valid_until_further_notice"] = df["valid_until_further_notice"].astype(bool)
         df["deleted"] = df["deleted"].astype(bool)
 
         print(f"Ingesting {len(df)} traffic events for {date.date()}")
         traffic_fg.insert(df, write_options={"wait_for_job": False})
-        
+
         return df
 
 
@@ -537,38 +554,82 @@ def main():
         api_key_value=HOPSWORKS_API_KEY
     )
     fs = project.get_feature_store()
-    
+
     # Calculate yesterday's date
     yesterday = datetime.now() - timedelta(days=1)
     yesterday_str = yesterday.strftime("%Y-%m-%d")
     yesterday_ts = pd.Timestamp(yesterday.date(), tz='UTC')
-    
+
     print(f"\n{'='*70}")
     print(f"Running daily feature pipeline for {yesterday.date()}")
     print(f"{'='*70}\n")
-    
+
     tmp_dir = tempfile.mkdtemp()
-    rt_rows_all = []
-    
+
     try:
         # Fetch KODA RT vehicle data for all 24 hours
         print(f"Fetching KODA real-time vehicle positions...")
         dates = [yesterday]
         trip_agg_df = ingest_koda_rt_data(dates, fs)
-        
+
         # Fetch Trafikverket traffic events
         print(f"\nFetching Trafikverket traffic events...")
         dates = [yesterday_ts]
-        
+
         traffic_df = ingest_trafikverket_events(dates, project)
-        
-        # Create enriched features combining trip + traffic
+
+        # Fetch weather data for yesterday
+        print(f"\nFetching weather data...")
+        try:
+            weather_df = fetch_weather_forecast(past_days=2, forecast_days=0)
+            # Filter to just yesterday
+            weather_df = weather_df[weather_df["date"] == yesterday.date()]
+
+            if not weather_df.empty:
+                print(f"  Fetched {len(weather_df)} hourly weather records")
+
+                # Ingest to weather feature group
+                weather_fg = fs.get_or_create_feature_group(
+                    name="weather_hourly_fg",
+                    version=1,
+                    primary_key=["timestamp", "latitude", "longitude"],
+                    event_time="timestamp",
+                    online_enabled=False,
+                    description="Hourly weather data from Open-Meteo for Östergötland region"
+                )
+                weather_fg.insert(clean_column_names(weather_df.copy()), write_options={"wait_for_job": False})
+                print(f"  Ingested weather data to weather_hourly_fg")
+            else:
+                print(f"  No weather data available for {yesterday.date()}")
+                weather_df = pd.DataFrame()
+        except Exception as e:
+            print(f"  Warning: Could not fetch weather data: {e}")
+            weather_df = pd.DataFrame()
+
+        # Fetch holiday data for yesterday
+        print(f"\nFetching holiday data...")
+        try:
+            holiday_features = get_holiday_features_for_date(yesterday)
+            print(f"  Holiday features: work_free={holiday_features['is_work_free']}, "
+                  f"red_day={holiday_features['is_red_day']}, "
+                  f"holiday={holiday_features['holiday_name']}")
+        except Exception as e:
+            print(f"  Warning: Could not fetch holiday data: {e}")
+            holiday_features = {
+                "is_work_free": False,
+                "is_red_day": False,
+                "is_day_before_holiday": False,
+                "is_holiday": False,
+                "holiday_name": None,
+            }
+
+        # Create enriched features combining trip + traffic + weather + holidays
         print(f"\nCreating enriched features...")
-        
+
         # Remove rows with null trip_id or window_start (primary keys)
         trip_agg_df = trip_agg_df[trip_agg_df['trip_id'].notna()]
-        
-        if traffic_df.empty:
+
+        if traffic_df is None or traffic_df.empty:
             enriched_df = trip_agg_df.copy()
             enriched_df["has_nearby_event"] = 0
             enriched_df["num_nearby_traffic_events"] = 0
@@ -580,14 +641,14 @@ def main():
             for idx, trip_row in trip_agg_df.iterrows():
                 window_start = trip_row["window_start"]
                 trip_lat, trip_lon = trip_row["lat_mean"], trip_row["lon_mean"]
-                
+
                 # Find active traffic events within 500m
                 if pd.notna(trip_lat) and pd.notna(trip_lon):
                     nearby = traffic_df[
                         (traffic_df["start_time"] <= window_start) &
                         (traffic_df["end_time"] >= window_start)
                     ].copy()
-                    
+
                     nearby["distance_m"] = nearby.apply(
                         lambda r: distance_m(trip_lat, trip_lon, r["latitude"], r["longitude"]),
                         axis=1
@@ -595,7 +656,7 @@ def main():
                     nearby = nearby[nearby["distance_m"] <= 500]
                 else:
                     nearby = pd.DataFrame()
-                
+
                 if nearby.empty:
                     enriched_data.append({
                         "has_nearby_event": 0,
@@ -608,17 +669,42 @@ def main():
                     max_severity = int(severity_codes.max()) if len(severity_codes) > 0 else None
                     affected_roads = nearby["affected_road"].dropna().unique()
                     roads_str = ",".join(str(r) for r in affected_roads) if len(affected_roads) > 0 else None
-                    
+
                     enriched_data.append({
                         "has_nearby_event": int(len(nearby) > 0),
                         "num_nearby_traffic_events": len(nearby),
                         "nearby_event_severity": max_severity,
                         "affected_roads": roads_str,
                     })
-            
+
             enriched_features = pd.DataFrame(enriched_data)
             enriched_df = pd.concat([trip_agg_df.reset_index(drop=True), enriched_features], axis=1)
-        
+
+        # Add weather features by joining on hour
+        if not weather_df.empty:
+            print(f"  Adding weather features...")
+            weather_hourly = weather_df[["hour", "temperature_2m", "precipitation", "rain",
+                                          "snowfall", "cloud_cover", "wind_speed_10m", "weather_code"]].copy()
+            weather_hourly = weather_hourly.drop_duplicates(subset=["hour"])
+
+            enriched_df = enriched_df.merge(weather_hourly, on="hour", how="left")
+            print(f"  Added weather features: temperature, precipitation, cloud_cover, wind_speed, etc.")
+        else:
+            # Add empty weather columns if no weather data
+            enriched_df["temperature_2m"] = None
+            enriched_df["precipitation"] = None
+            enriched_df["rain"] = None
+            enriched_df["snowfall"] = None
+            enriched_df["cloud_cover"] = None
+            enriched_df["wind_speed_10m"] = None
+            enriched_df["weather_code"] = None
+
+        # Add holiday features (same for all rows since it's a single day)
+        enriched_df["is_work_free"] = holiday_features["is_work_free"]
+        enriched_df["is_red_day"] = holiday_features["is_red_day"]
+        enriched_df["is_day_before_holiday"] = holiday_features["is_day_before_holiday"]
+        enriched_df["is_holiday"] = holiday_features["is_holiday"]
+
         # Ingest to combined feature group
         print(f"  Creating/updating trip_occupancy_features_daily...")
         enriched_fg = fs.get_or_create_feature_group(
@@ -627,9 +713,9 @@ def main():
             primary_key=["trip_id", "window_start"],
             event_time="window_start",
             online_enabled=False,
-            description="Daily enriched trip features with vehicle metrics and nearby traffic events"
+            description="Daily enriched trip features with vehicle metrics, traffic events, weather, and holidays"
         )
-        
+
         # Standardize column names
         enriched_df.columns = (
             enriched_df.columns
@@ -637,7 +723,7 @@ def main():
             .str.lower()
             .str.replace(" ", "_")
         )
-        
+
         # Ensure numeric columns have proper dtypes to avoid Delta Lake serialization issues
         for col in enriched_df.columns:
             if enriched_df[col].dtype == 'object':
@@ -648,39 +734,39 @@ def main():
                         enriched_df[col] = converted
                 except (ValueError, TypeError):
                     pass
-        
+
         # Ensure enrichment feature types match schema exactly
         # has_nearby_event -> bigint (int64)
         if 'has_nearby_event' in enriched_df.columns:
             enriched_df['has_nearby_event'] = enriched_df['has_nearby_event'].astype('int64')
-        
+
         # num_nearby_traffic_events -> bigint (int64)
         if 'num_nearby_traffic_events' in enriched_df.columns:
             enriched_df['num_nearby_traffic_events'] = enriched_df['num_nearby_traffic_events'].astype('int64')
-        
+
         # nearby_event_severity -> double (float64)
         if 'nearby_event_severity' in enriched_df.columns:
             enriched_df['nearby_event_severity'] = enriched_df['nearby_event_severity'].astype('float64')
-        
+
         # affected_roads -> string
         if 'affected_roads' in enriched_df.columns:
             enriched_df['affected_roads'] = enriched_df['affected_roads'].astype(str)
-        
+
         # vehicle_id -> string (primary key in vehicle_trip_agg_fg is string)
         if 'vehicle_id' in enriched_df.columns:
             enriched_df['vehicle_id'] = enriched_df['vehicle_id'].astype(str)
-            
-        
+
+
         # Replace NaN with None for consistency
         enriched_df = enriched_df.where(pd.notna(enriched_df), None)
-        
+
         # Ensure primary key column (trip_id) are strings and non-null
         enriched_df['trip_id'] = enriched_df['trip_id'].astype(str)
-        
+
         # Drop any rows with null primary keys
         enriched_df = enriched_df[enriched_df['trip_id'] != 'nan']
         enriched_df = enriched_df[enriched_df['trip_id'].notna()]
-        
+
         print(f"  DataFrame dtypes before insert:")
         print(enriched_df.dtypes)
         print(f"  Rows with null trip_id: {enriched_df['trip_id'].isna().sum()}")
@@ -691,7 +777,7 @@ def main():
         print(f"    - num_nearby_traffic_events: {enriched_df['num_nearby_traffic_events'].dtype if 'num_nearby_traffic_events' in enriched_df.columns else 'N/A'} (expect: int64)")
         print(f"    - nearby_event_severity: {enriched_df['nearby_event_severity'].dtype if 'nearby_event_severity' in enriched_df.columns else 'N/A'} (expect: float64)")
         print(f"    - affected_roads: {enriched_df['affected_roads'].dtype if 'affected_roads' in enriched_df.columns else 'N/A'} (expect: object/string)")
-        
+
         # Retry insert with backoff for transient Hopsworks errors
         insert_retries = 0
         while insert_retries < 3:
@@ -709,11 +795,11 @@ def main():
                 else:
                     print(f"  Insert failed after 3 retries: {e}")
                     raise
-        
+
         print(f"\n{'='*70}")
         print(f"Daily feature pipeline completed successfully for {yesterday.date()}")
         print(f"{'='*70}\n")
-        
+
     finally:
         # Cleanup
         import shutil
