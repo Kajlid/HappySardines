@@ -649,10 +649,27 @@ def main():
                 except (ValueError, TypeError):
                     pass
         
-        # Ensure booleans are proper type
-        for col in ['has_nearby_event']:
-            if col in enriched_df.columns:
-                enriched_df[col] = enriched_df[col].astype('int32')
+        # Ensure enrichment feature types match schema exactly
+        # has_nearby_event -> bigint (int64)
+        if 'has_nearby_event' in enriched_df.columns:
+            enriched_df['has_nearby_event'] = enriched_df['has_nearby_event'].astype('int64')
+        
+        # num_nearby_traffic_events -> bigint (int64)
+        if 'num_nearby_traffic_events' in enriched_df.columns:
+            enriched_df['num_nearby_traffic_events'] = enriched_df['num_nearby_traffic_events'].astype('int64')
+        
+        # nearby_event_severity -> double (float64)
+        if 'nearby_event_severity' in enriched_df.columns:
+            enriched_df['nearby_event_severity'] = enriched_df['nearby_event_severity'].astype('float64')
+        
+        # affected_roads -> string
+        if 'affected_roads' in enriched_df.columns:
+            enriched_df['affected_roads'] = enriched_df['affected_roads'].astype(str)
+        
+        # vehicle_id -> string (primary key in vehicle_trip_agg_fg is string)
+        if 'vehicle_id' in enriched_df.columns:
+            enriched_df['vehicle_id'] = enriched_df['vehicle_id'].astype(str)
+            
         
         # Replace NaN with None for consistency
         enriched_df = enriched_df.where(pd.notna(enriched_df), None)
@@ -667,6 +684,13 @@ def main():
         print(f"  DataFrame dtypes before insert:")
         print(enriched_df.dtypes)
         print(f"  Rows with null trip_id: {enriched_df['trip_id'].isna().sum()}")
+        print(f"  Field type verification:")
+        print(f"    - trip_id: {enriched_df['trip_id'].dtype if 'trip_id' in enriched_df.columns else 'N/A'} (expect: object/string)")
+        print(f"    - vehicle_id: {enriched_df['vehicle_id'].dtype if 'vehicle_id' in enriched_df.columns else 'N/A'} (expect: object/string)")
+        print(f"    - has_nearby_event: {enriched_df['has_nearby_event'].dtype if 'has_nearby_event' in enriched_df.columns else 'N/A'} (expect: int64)")
+        print(f"    - num_nearby_traffic_events: {enriched_df['num_nearby_traffic_events'].dtype if 'num_nearby_traffic_events' in enriched_df.columns else 'N/A'} (expect: int64)")
+        print(f"    - nearby_event_severity: {enriched_df['nearby_event_severity'].dtype if 'nearby_event_severity' in enriched_df.columns else 'N/A'} (expect: float64)")
+        print(f"    - affected_roads: {enriched_df['affected_roads'].dtype if 'affected_roads' in enriched_df.columns else 'N/A'} (expect: object/string)")
         
         # Retry insert with backoff for transient Hopsworks errors
         insert_retries = 0
