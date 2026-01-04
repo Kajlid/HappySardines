@@ -4,6 +4,7 @@ import xml.etree.ElementTree as ET
 import pandas as pd
 from haversine import haversine, Unit
 from datetime import datetime, timedelta
+import great_expectations as ge
 
 MAX_RETRIES = 3
 WAIT_SECONDS = 5  # wait between retries
@@ -60,6 +61,23 @@ def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
         for col in df.columns
     ]
     return df
+
+def validate_with_expectations(df, expectation_suite, name="dataset"):
+    """
+    Run Great Expectations validation before ingestion.
+    Prints results and raises an error if validation fails.
+    """
+    ge_df = ge.from_pandas(df)
+    validation_result = ge_df.validate(expectation_suite=expectation_suite)
+    
+    if not validation_result.success:
+        print(f"Validation failed for {name}")
+        for res in validation_result.results:
+            if not res.success:
+                print(f" - {res.expectation_config.expectation_type} failed: {res.result}")
+        raise ValueError(f"Validation failed for {name}.")
+    else:
+        print(f"Validation passed for {name}")  
 
 def distance_m(lat1, lon1, lat2, lon2):
     """Calculate distance in meters between two points."""
