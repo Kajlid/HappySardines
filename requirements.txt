@@ -18,3 +18,5 @@ protobuf
 py7zr
 pyarrow
 haversine
+xgboost>=2.0.0
+python-dotenv>=1.0.0
