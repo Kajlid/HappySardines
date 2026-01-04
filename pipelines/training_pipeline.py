@@ -49,17 +49,29 @@ FEATURE_VIEW_NAME = "occupancy_fv"
 FEATURE_VIEW_VERSION = 1
 
 # XGBoost hyperparameters (inspired by WheelyFunTimes, tuned for our 4-class problem)
+# Using softprob to get probabilities for threshold tuning
 XGBOOST_PARAMS = {
     "tree_method": "hist",
     "enable_categorical": True,
-    "max_depth": 7,
-    "learning_rate": 0.02,
-    "n_estimators": 150,
-    "subsample": 0.6,
+    "max_depth": 8,
+    "learning_rate": 0.05,
+    "n_estimators": 200,
+    "subsample": 0.7,
     "colsample_bytree": 0.8,
-    "objective": "multi:softmax",
+    "min_child_weight": 1,
+    "gamma": 0.1,
+    "objective": "multi:softprob",
     "num_class": 4,
     "random_state": 42,
+}
+
+# Class weight multipliers for severe imbalance
+# Classes 2-3 are very rare, boost their importance significantly
+CLASS_WEIGHT_MULTIPLIER = {
+    0: 1.0,   # EMPTY (72%) - baseline
+    1: 2.0,   # MANY_SEATS (26%) - slight boost
+    2: 10.0,  # FEW_SEATS (1%) - significant boost
+    3: 20.0,  # STANDING (0.4%) - heavy boost
 }
 
 # Features to use for training
@@ -316,14 +328,21 @@ def prepare_data(df, test_start_date=None, test_ratio=0.2):
 
 
 def compute_sample_weights(y_train):
-    """Compute sample weights to handle class imbalance."""
+    """Compute sample weights to handle class imbalance with custom multipliers."""
     from sklearn.utils.class_weight import compute_class_weight
 
     classes = np.unique(y_train)
-    class_weights = compute_class_weight('balanced', classes=classes, y=y_train)
-    weight_dict = dict(zip(classes, class_weights))
+    base_weights = compute_class_weight('balanced', classes=classes, y=y_train)
+    base_weight_dict = dict(zip(classes, base_weights))
 
-    print(f"  Class weights: {weight_dict}")
+    # Apply additional multipliers for severe imbalance
+    weight_dict = {}
+    for cls in classes:
+        multiplier = CLASS_WEIGHT_MULTIPLIER.get(cls, 1.0)
+        weight_dict[cls] = base_weight_dict[cls] * multiplier
+
+    print(f"  Base class weights: {base_weight_dict}")
+    print(f"  Adjusted class weights: {weight_dict}")
 
     sample_weights = np.array([weight_dict[y] for y in y_train])
     return sample_weights
@@ -350,7 +369,9 @@ def evaluate_model(model, X_test, y_test):
     """Evaluate model and return metrics."""
     print("\nEvaluating model...")
 
-    y_pred = model.predict(X_test)
+    # Get probabilities (since we use softprob objective)
+    y_proba = model.predict_proba(X_test)
+    y_pred = np.argmax(y_proba, axis=1)
 
     # Calculate metrics (weighted for class imbalance)
     accuracy = accuracy_score(y_test, y_pred)
@@ -358,11 +379,18 @@ def evaluate_model(model, X_test, y_test):
     recall = recall_score(y_test, y_pred, average="weighted", zero_division=0)
     f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
 
+    # Also calculate per-class recall (important for rare classes)
+    per_class_recall = recall_score(y_test, y_pred, average=None, zero_division=0)
+
     metrics = {
         "accuracy": float(accuracy),
         "precision_weighted": float(precision),
         "recall_weighted": float(recall),
         "f1_weighted": float(f1),
+        "recall_class_0": float(per_class_recall[0]) if len(per_class_recall) > 0 else 0,
+        "recall_class_1": float(per_class_recall[1]) if len(per_class_recall) > 1 else 0,
+        "recall_class_2": float(per_class_recall[2]) if len(per_class_recall) > 2 else 0,
+        "recall_class_3": float(per_class_recall[3]) if len(per_class_recall) > 3 else 0,
     }
 
     print(f"\n  Results:")
@@ -370,6 +398,11 @@ def evaluate_model(model, X_test, y_test):
     print(f"    Precision: {precision:.4f} (weighted)")
     print(f"    Recall:    {recall:.4f} (weighted)")
     print(f"    F1 Score:  {f1:.4f} (weighted)")
+    print(f"\n  Per-class Recall (critical for rare classes):")
+    class_names = ["EMPTY", "MANY_SEATS", "FEW_SEATS", "STANDING"]
+    for i, name in enumerate(class_names):
+        if i < len(per_class_recall):
+            print(f"    Class {i} ({name}): {per_class_recall[i]:.4f}")
 
     # Confusion matrix
     cm = confusion_matrix(y_test, y_pred)
