@@ -587,6 +587,9 @@ def main():
 
             if not weather_df.empty:
                 print(f"  Fetched {len(weather_df)} hourly weather records")
+                
+                # Ensure hour is int64 for Hopsworks schema compatibility
+                weather_df["hour"] = weather_df["hour"].astype('int64')
 
                 # Ingest to weather feature group
                 weather_fg = fs.get_or_create_feature_group(
@@ -683,21 +686,30 @@ def main():
         # Add weather features by joining on hour
         if not weather_df.empty:
             print(f"  Adding weather features...")
-            weather_hourly = weather_df[["hour", "temperature_2m", "precipitation", "rain",
-                                          "snowfall", "cloud_cover", "wind_speed_10m", "weather_code"]].copy()
+            # Select weather columns that exist in the data
+            weather_cols_to_select = ["hour"]
+            weather_schema_cols = ["temperature_2m", "relative_humidity_2m", "precipitation", "rain",
+                                    "snowfall", "cloud_cover", "wind_speed_10m", "wind_gusts_10m", "weather_code"]
+            for col in weather_schema_cols:
+                if col in weather_df.columns:
+                    weather_cols_to_select.append(col)
+            
+            weather_hourly = weather_df[weather_cols_to_select].copy()
             weather_hourly = weather_hourly.drop_duplicates(subset=["hour"])
 
             enriched_df = enriched_df.merge(weather_hourly, on="hour", how="left")
             print(f"  Added weather features: temperature, precipitation, cloud_cover, wind_speed, etc.")
         else:
             # Add empty weather columns if no weather data
-            enriched_df["temperature_2m"] = None
-            enriched_df["precipitation"] = None
-            enriched_df["rain"] = None
-            enriched_df["snowfall"] = None
-            enriched_df["cloud_cover"] = None
-            enriched_df["wind_speed_10m"] = None
-            enriched_df["weather_code"] = None
+            enriched_df["temperature_2m"] = np.nan
+            enriched_df["relative_humidity_2m"] = np.nan
+            enriched_df["precipitation"] = np.nan
+            enriched_df["rain"] = np.nan
+            enriched_df["snowfall"] = np.nan
+            enriched_df["cloud_cover"] = np.nan
+            enriched_df["wind_speed_10m"] = np.nan
+            enriched_df["wind_gusts_10m"] = np.nan
+            enriched_df["weather_code"] = np.nan
 
         # Add holiday features (same for all rows since it's a single day)
         enriched_df["is_work_free"] = holiday_features["is_work_free"]
@@ -708,7 +720,7 @@ def main():
         # Ingest to combined feature group
         print(f"  Creating/updating trip_occupancy_features_daily...")
         enriched_fg = fs.get_or_create_feature_group(
-            name="trip_occupancy_features_daily",
+            name="combined_features_daily",
             version=1,
             primary_key=["trip_id", "window_start"],
             event_time="window_start",
@@ -755,6 +767,35 @@ def main():
         # vehicle_id -> string (primary key in vehicle_trip_agg_fg is string)
         if 'vehicle_id' in enriched_df.columns:
             enriched_df['vehicle_id'] = enriched_df['vehicle_id'].astype(str)
+        
+        # Weather columns -> match exact schema types
+        # double (float64)
+        weather_double_cols = ["temperature_2m", "precipitation", "rain", "snowfall", "wind_speed_10m", "wind_gusts_10m"]
+        for col in weather_double_cols:
+            if col in enriched_df.columns:
+                enriched_df[col] = pd.to_numeric(enriched_df[col], errors='coerce').astype('float64')
+        
+        # bigint (int64)
+        weather_bigint_cols = ["relative_humidity_2m", "cloud_cover", "weather_code"]
+        for col in weather_bigint_cols:
+            if col in enriched_df.columns:
+                enriched_df[col] = pd.to_numeric(enriched_df[col], errors='coerce').astype('int64')
+        
+        # hour -> int64 for schema compatibility
+        if 'hour' in enriched_df.columns:
+            enriched_df['hour'] = enriched_df['hour'].astype('int64')
+        
+        # day_of_week -> int32 (int type in Hopsworks)
+        if 'day_of_week' in enriched_df.columns:
+            enriched_df['day_of_week'] = enriched_df['day_of_week'].astype('int32')
+        
+        # n_positions -> int64
+        if 'n_positions' in enriched_df.columns:
+            enriched_df['n_positions'] = enriched_df['n_positions'].astype('int64')
+        
+        # occupancy_mode -> int64
+        if 'occupancy_mode' in enriched_df.columns:
+            enriched_df['occupancy_mode'] = enriched_df['occupancy_mode'].astype('int64')
 
 
         # Replace NaN with None for consistency
