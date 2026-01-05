@@ -12,7 +12,6 @@ defaults:
 jobs:
   update-features:
     runs-on: ubuntu-latest
-    timeout-minutes: 180     # 3 h timeout instead of GH default 6 hours
 
     steps:
       - name: Checkout repository
