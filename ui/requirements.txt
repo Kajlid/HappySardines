@@ -1,0 +1,8 @@
+gradio>=4.0.0
+folium>=0.15.0
+hopsworks
+xgboost>=2.0.0
+pandas
+numpy
+requests
+python-dotenv
