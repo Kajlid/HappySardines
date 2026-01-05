@@ -361,10 +361,14 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg):
     holiday_df = holiday_fg.read()
     print(f"    {len(holiday_df)} rows", flush=True)
 
-    # Skip traffic data for now - it adds minimal value and slows down training
-    # The traffic event calculation is O(n*m) and takes too long for 6M+ rows
-    print("  Skipping traffic data (disabled for performance)", flush=True)
-    traffic_df = None
+    # Fetch traffic data
+    print("  Reading trafikverket_traffic_event_fg...", flush=True)
+    try:
+        traffic_df = traffic_fg.read()
+        print(f"    {len(traffic_df)} rows", flush=True)
+    except Exception as e:
+        print(f"    Warning: Could not read traffic data: {e}", flush=True)
+        traffic_df = None
 
     # Prepare for joining
     # Ensure date columns are comparable
@@ -396,9 +400,8 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg):
         how="left"
     )
 
-    # Skip traffic event calculation - just set defaults
-    joined_df["has_nearby_event"] = 0
-    joined_df["num_nearby_traffic_events"] = 0
+    # Calculate nearby traffic events
+    joined_df = calculate_nearby_traffic_events(joined_df, traffic_df)
 
     print(f"  Final joined dataset: {len(joined_df)} rows", flush=True)
 

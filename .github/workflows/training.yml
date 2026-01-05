@@ -23,7 +23,7 @@ defaults:
 jobs:
   train-model:
     runs-on: ubuntu-latest
-    timeout-minutes: 90     # increased for large dataset fetch from Hopsworks
+    timeout-minutes: 180    # allow time for traffic event calculation
 
     steps:
       - name: Checkout repository
