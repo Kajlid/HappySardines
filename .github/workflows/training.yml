@@ -23,7 +23,7 @@ defaults:
 jobs:
   train-model:
     runs-on: ubuntu-latest
-    timeout-minutes: 60     # training should complete within 1 hour
+    timeout-minutes: 90     # increased for large dataset fetch from Hopsworks
 
     steps:
       - name: Checkout repository
