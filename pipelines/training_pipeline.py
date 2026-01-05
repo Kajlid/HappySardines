@@ -272,8 +272,8 @@ def calculate_nearby_traffic_events(vehicle_df, traffic_df):
         if date_trips.empty:
             continue
 
-        # Convert date to datetime for comparison
-        date_start = pd.Timestamp(date)
+        # Convert date to datetime for comparison (must be tz-aware to match traffic_df)
+        date_start = pd.Timestamp(date, tz='UTC')
         date_end = date_start + pd.Timedelta(days=1)
 
         # Get traffic events that could be active on this date
