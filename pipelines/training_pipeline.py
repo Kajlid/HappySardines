@@ -212,14 +212,15 @@ def distance_m(lat1, lon1, lat2, lon2):
 
 def calculate_nearby_traffic_events(vehicle_df, traffic_df):
     """
-    Calculate nearby traffic events for each vehicle trip.
+    Calculate nearby traffic events for each vehicle trip (optimized version).
 
+    Uses vectorized operations and date-based bucketing to avoid O(n²) complexity.
     For each trip, counts active traffic events within TRAFFIC_EVENT_RADIUS_M meters
     of the trip's mean location during the trip's window_start time.
 
     Returns DataFrame with has_nearby_event and num_nearby_traffic_events columns.
     """
-    print("  Calculating nearby traffic events...")
+    print("  Calculating nearby traffic events (optimized)...")
 
     if traffic_df is None or traffic_df.empty:
         print("    No traffic data available, setting defaults")
@@ -228,6 +229,9 @@ def calculate_nearby_traffic_events(vehicle_df, traffic_df):
         return vehicle_df
 
     # Ensure timestamps are comparable
+    vehicle_df = vehicle_df.copy()
+    traffic_df = traffic_df.copy()
+
     if "window_start" in vehicle_df.columns:
         vehicle_df["window_start"] = pd.to_datetime(vehicle_df["window_start"])
     if "start_time" in traffic_df.columns:
@@ -235,48 +239,97 @@ def calculate_nearby_traffic_events(vehicle_df, traffic_df):
     if "end_time" in traffic_df.columns:
         traffic_df["end_time"] = pd.to_datetime(traffic_df["end_time"])
 
-    has_nearby = []
-    num_nearby = []
+    # Filter traffic events to only those with valid coordinates
+    traffic_df = traffic_df.dropna(subset=["latitude", "longitude", "start_time", "end_time"])
 
-    for idx, trip_row in vehicle_df.iterrows():
-        window_start = trip_row.get("window_start")
-        trip_lat = trip_row.get("lat_mean")
-        trip_lon = trip_row.get("lon_mean")
+    if traffic_df.empty:
+        print("    No valid traffic events with coordinates")
+        vehicle_df["has_nearby_event"] = 0
+        vehicle_df["num_nearby_traffic_events"] = 0
+        return vehicle_df
 
-        if pd.isna(trip_lat) or pd.isna(trip_lon) or pd.isna(window_start):
-            has_nearby.append(0)
-            num_nearby.append(0)
+    print(f"    Processing {len(vehicle_df)} trips against {len(traffic_df)} traffic events...")
+
+    # Get date range from vehicle data
+    vehicle_df["_date"] = vehicle_df["window_start"].dt.date
+
+    # Initialize result columns
+    vehicle_df["has_nearby_event"] = 0
+    vehicle_df["num_nearby_traffic_events"] = 0
+
+    # Process by date to reduce comparisons
+    unique_dates = vehicle_df["_date"].unique()
+    total_nearby = 0
+
+    for i, date in enumerate(unique_dates):
+        if i % 10 == 0:
+            print(f"    Processing date {i+1}/{len(unique_dates)}...")
+
+        # Get trips for this date
+        date_mask = vehicle_df["_date"] == date
+        date_trips = vehicle_df.loc[date_mask]
+
+        if date_trips.empty:
             continue
 
-        # Find active traffic events at this time
-        active_events = traffic_df[
-            (traffic_df["start_time"] <= window_start) &
-            (traffic_df["end_time"] >= window_start)
-        ]
+        # Convert date to datetime for comparison
+        date_start = pd.Timestamp(date)
+        date_end = date_start + pd.Timedelta(days=1)
 
-        if active_events.empty:
-            has_nearby.append(0)
-            num_nearby.append(0)
+        # Get traffic events that could be active on this date
+        # Event is potentially active if: start_time <= end_of_day AND end_time >= start_of_day
+        active_mask = (traffic_df["start_time"] <= date_end) & (traffic_df["end_time"] >= date_start)
+        day_events = traffic_df.loc[active_mask]
+
+        if day_events.empty:
             continue
 
-        # Filter to events within radius
-        nearby_count = 0
-        for _, event in active_events.iterrows():
-            event_lat = event.get("latitude")
-            event_lon = event.get("longitude")
-            if pd.notna(event_lat) and pd.notna(event_lon):
-                dist = distance_m(trip_lat, trip_lon, event_lat, event_lon)
-                if dist <= TRAFFIC_EVENT_RADIUS_M:
-                    nearby_count += 1
+        # For each trip on this date, check against day's events
+        for idx in date_trips.index:
+            trip_time = vehicle_df.at[idx, "window_start"]
+            trip_lat = vehicle_df.at[idx, "lat_mean"]
+            trip_lon = vehicle_df.at[idx, "lon_mean"]
 
-        has_nearby.append(1 if nearby_count > 0 else 0)
-        num_nearby.append(nearby_count)
+            if pd.isna(trip_lat) or pd.isna(trip_lon) or pd.isna(trip_time):
+                continue
 
-    vehicle_df["has_nearby_event"] = has_nearby
-    vehicle_df["num_nearby_traffic_events"] = num_nearby
+            # Filter to events active at this specific time
+            time_mask = (day_events["start_time"] <= trip_time) & (day_events["end_time"] >= trip_time)
+            active_events = day_events.loc[time_mask]
 
-    nearby_trips = sum(has_nearby)
-    print(f"    {nearby_trips} trips ({100*nearby_trips/len(vehicle_df):.1f}%) have nearby traffic events")
+            if active_events.empty:
+                continue
+
+            # Vectorized distance calculation using haversine formula
+            event_lats = active_events["latitude"].values
+            event_lons = active_events["longitude"].values
+
+            # Calculate distances using numpy (approximate haversine)
+            # Convert to radians
+            lat1_rad = np.radians(trip_lat)
+            lon1_rad = np.radians(trip_lon)
+            lat2_rad = np.radians(event_lats)
+            lon2_rad = np.radians(event_lons)
+
+            # Haversine formula
+            dlat = lat2_rad - lat1_rad
+            dlon = lon2_rad - lon1_rad
+            a = np.sin(dlat/2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon/2)**2
+            c = 2 * np.arcsin(np.sqrt(a))
+            distances = 6371000 * c  # Earth radius in meters
+
+            # Count nearby events
+            nearby_count = np.sum(distances <= TRAFFIC_EVENT_RADIUS_M)
+
+            if nearby_count > 0:
+                vehicle_df.at[idx, "has_nearby_event"] = 1
+                vehicle_df.at[idx, "num_nearby_traffic_events"] = int(nearby_count)
+                total_nearby += 1
+
+    # Clean up temp column
+    vehicle_df.drop(columns=["_date"], inplace=True)
+
+    print(f"    {total_nearby} trips ({100*total_nearby/len(vehicle_df):.1f}%) have nearby traffic events")
 
     return vehicle_df
 
