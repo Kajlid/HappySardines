@@ -1,4 +1,4 @@
-hopsworks[python]>=3.6.0
+hopsworks[python]==4.2.*
 pandas
 polars
 numpy>=1.26.4
