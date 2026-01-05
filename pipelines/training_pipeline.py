@@ -120,27 +120,28 @@ TRAFFIC_EVENT_RADIUS_M = 500
 
 def connect_to_hopsworks():
     """Connect to Hopsworks and return project, feature store, and model registry."""
-    print("Connecting to Hopsworks...")
+    print("Connecting to Hopsworks...", flush=True)
     project = hopsworks.login()
+    print(f"Connected to project: {project.name}", flush=True)
     fs = project.get_feature_store()
+    print("Got feature store", flush=True)
     mr = project.get_model_registry()
-    print(f"Connected to project: {project.name}")
+    print("Got model registry", flush=True)
     return project, fs, mr
 
 
 def get_feature_groups(fs):
     """Retrieve feature groups from the feature store."""
-    print("Retrieving feature groups...")
+    print("Retrieving feature groups...", flush=True)
 
     vehicle_fg = fs.get_feature_group(name="vehicle_trip_agg_fg", version=2)
+    print("  - vehicle_trip_agg_fg (v2)", flush=True)
     weather_fg = fs.get_feature_group(name="weather_hourly_fg", version=1)
+    print("  - weather_hourly_fg (v1)", flush=True)
     holiday_fg = fs.get_feature_group(name="swedish_holidays_fg", version=1)
+    print("  - swedish_holidays_fg (v1)", flush=True)
     traffic_fg = fs.get_feature_group(name="trafikverket_traffic_event_fg", version=2)
-
-    print(f"  - vehicle_trip_agg_fg (v2)")
-    print(f"  - weather_hourly_fg (v1)")
-    print(f"  - swedish_holidays_fg (v1)")
-    print(f"  - trafikverket_traffic_event_fg (v2)")
+    print("  - trafikverket_traffic_event_fg (v2)", flush=True)
 
     return vehicle_fg, weather_fg, holiday_fg, traffic_fg
 
@@ -341,31 +342,29 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg):
 
     Returns joined DataFrame with features and target.
     """
-    print("Fetching data manually from feature groups...")
+    import sys
+
+    print("Fetching data manually from feature groups...", flush=True)
 
     # Fetch vehicle data (main training data with target)
-    print("  Reading vehicle_trip_agg_fg...")
+    print("  Reading vehicle_trip_agg_fg...", flush=True)
     vehicle_df = vehicle_fg.read()
-    print(f"    {len(vehicle_df)} rows")
+    print(f"    {len(vehicle_df)} rows", flush=True)
 
     # Fetch weather data
-    print("  Reading weather_hourly_fg...")
+    print("  Reading weather_hourly_fg...", flush=True)
     weather_df = weather_fg.read()
-    print(f"    {len(weather_df)} rows")
+    print(f"    {len(weather_df)} rows", flush=True)
 
     # Fetch holiday data
-    print("  Reading swedish_holidays_fg...")
+    print("  Reading swedish_holidays_fg...", flush=True)
     holiday_df = holiday_fg.read()
-    print(f"    {len(holiday_df)} rows")
+    print(f"    {len(holiday_df)} rows", flush=True)
 
-    # Fetch traffic data
-    print("  Reading trafikverket_traffic_event_fg...")
-    try:
-        traffic_df = traffic_fg.read()
-        print(f"    {len(traffic_df)} rows")
-    except Exception as e:
-        print(f"    Warning: Could not read traffic data: {e}")
-        traffic_df = None
+    # Skip traffic data for now - it adds minimal value and slows down training
+    # The traffic event calculation is O(n*m) and takes too long for 6M+ rows
+    print("  Skipping traffic data (disabled for performance)", flush=True)
+    traffic_df = None
 
     # Prepare for joining
     # Ensure date columns are comparable
@@ -382,7 +381,7 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg):
     holiday_subset = holiday_df[holiday_cols].drop_duplicates(subset=["date"])
 
     # Join vehicle with weather on date + hour
-    print("  Joining vehicle with weather on (date, hour)...")
+    print("  Joining vehicle with weather on (date, hour)...", flush=True)
     joined_df = vehicle_df.merge(
         weather_subset,
         on=["date", "hour"],
@@ -390,17 +389,18 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg):
     )
 
     # Join with holidays on date
-    print("  Joining with holidays on (date)...")
+    print("  Joining with holidays on (date)...", flush=True)
     joined_df = joined_df.merge(
         holiday_subset,
         on=["date"],
         how="left"
     )
 
-    # Calculate nearby traffic events
-    joined_df = calculate_nearby_traffic_events(joined_df, traffic_df)
+    # Skip traffic event calculation - just set defaults
+    joined_df["has_nearby_event"] = 0
+    joined_df["num_nearby_traffic_events"] = 0
 
-    print(f"  Final joined dataset: {len(joined_df)} rows")
+    print(f"  Final joined dataset: {len(joined_df)} rows", flush=True)
 
     return joined_df
 

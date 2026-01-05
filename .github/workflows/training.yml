@@ -43,10 +43,11 @@ jobs:
       - name: Run training pipeline
         env:
           TZ: UTC
+          PYTHONUNBUFFERED: "1"
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
           TEST_START_DATE: ${{ inputs.test_start_date }}
           UPLOAD_MODEL: ${{ inputs.upload_model }}
 
         run: |
-            python pipelines/run_training.py
+            python -u pipelines/run_training.py
