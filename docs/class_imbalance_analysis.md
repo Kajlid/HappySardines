@@ -10,8 +10,13 @@ Our bus occupancy dataset has severe class imbalance:
 | 1 | MANY_SEATS_AVAILABLE | 26.3% |
 | 2 | FEW_SEATS_AVAILABLE | 1.0% |
 | 3 | STANDING_ROOM_ONLY | 0.4% |
+| 4 | CRUSHED_STANDING_ROOM_ONLY | 0% (not observed) |
+| 5 | FULL | 0% (not observed) |
+| 6 | NOT_ACCEPTING_PASSENGERS | 0% (not observed) |
 
-Classes 2 and 3 (the crowded buses we want to predict) make up only **1.4%** of the data.
+Classes 2 and 3 (the crowded buses we want to predict) make up only **1.4%** of the data. Classes 4-6 exist in the GTFS-RT specification but have not been observed in our dataset.
+
+**Note**: The model uses `num_class=7` to be robust for all GTFS-RT OccupancyStatus values, even though our current data only contains classes 0-3.
 
 ### Initial Model Results (No Class Weighting)
 
@@ -49,6 +54,9 @@ CLASS_WEIGHT_MULTIPLIER = {
     1: 2.0,   # MANY_SEATS - slight boost
     2: 10.0,  # FEW_SEATS - significant boost
     3: 20.0,  # STANDING - heavy boost
+    4: 25.0,  # CRUSHED_STANDING - not observed yet
+    5: 30.0,  # FULL - not observed yet
+    6: 1.0,   # NOT_ACCEPTING_PASSENGERS - not observed yet
 }
 ```
 

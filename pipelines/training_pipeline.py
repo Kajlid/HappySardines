@@ -5,7 +5,7 @@ This pipeline:
 1. Connects to Hopsworks Feature Store
 2. Creates a Feature View joining vehicle, weather, and holiday data
 3. Splits data by date (time-series appropriate)
-4. Trains an XGBoost Classifier for occupancy prediction (4 classes: 0-3)
+4. Trains an XGBoost Classifier for occupancy prediction (7 GTFS-RT classes: 0-6)
 5. Evaluates with weighted metrics for class imbalance
 6. Registers the model in Hopsworks Model Registry with lineage
 
@@ -25,6 +25,7 @@ import hopsworks
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
+from haversine import haversine, Unit
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -48,8 +49,10 @@ MODEL_NAME = "occupancy_xgboost_model"
 FEATURE_VIEW_NAME = "occupancy_fv"
 FEATURE_VIEW_VERSION = 1
 
-# XGBoost hyperparameters (inspired by WheelyFunTimes, tuned for our 4-class problem)
+# XGBoost hyperparameters
 # Using softprob to get probabilities for threshold tuning
+# num_class=7 to be robust for all GTFS-RT OccupancyStatus values (0-6)
+# even though our current data only has classes 0-3
 XGBOOST_PARAMS = {
     "tree_method": "hist",
     "enable_categorical": True,
@@ -61,17 +64,21 @@ XGBOOST_PARAMS = {
     "min_child_weight": 1,
     "gamma": 0.1,
     "objective": "multi:softprob",
-    "num_class": 4,
+    "num_class": 7,  # GTFS-RT has 7 occupancy classes (0-6)
     "random_state": 42,
 }
 
 # Class weight multipliers for severe imbalance
 # Classes 2-3 are very rare, boost their importance significantly
+# Classes 4-6 not yet observed but included for robustness
 CLASS_WEIGHT_MULTIPLIER = {
     0: 1.0,   # EMPTY (72%) - baseline
     1: 2.0,   # MANY_SEATS (26%) - slight boost
     2: 10.0,  # FEW_SEATS (1%) - significant boost
     3: 20.0,  # STANDING (0.4%) - heavy boost
+    4: 25.0,  # CRUSHED_STANDING - not observed yet
+    5: 30.0,  # FULL - not observed yet
+    6: 1.0,   # NOT_ACCEPTING_PASSENGERS - not observed yet
 }
 
 # Features to use for training
@@ -99,8 +106,16 @@ HOLIDAY_FEATURES = [
     "is_day_before_holiday",
 ]
 
+TRAFFIC_FEATURES = [
+    "has_nearby_event",
+    "num_nearby_traffic_events",
+]
+
 # Target variable
 TARGET = "occupancy_mode"
+
+# Distance threshold for "nearby" traffic events (meters)
+TRAFFIC_EVENT_RADIUS_M = 500
 
 
 def connect_to_hopsworks():
@@ -120,12 +135,14 @@ def get_feature_groups(fs):
     vehicle_fg = fs.get_feature_group(name="vehicle_trip_agg_fg", version=2)
     weather_fg = fs.get_feature_group(name="weather_hourly_fg", version=1)
     holiday_fg = fs.get_feature_group(name="swedish_holidays_fg", version=1)
+    traffic_fg = fs.get_feature_group(name="trafikverket_traffic_event_fg", version=2)
 
     print(f"  - vehicle_trip_agg_fg (v2)")
     print(f"  - weather_hourly_fg (v1)")
     print(f"  - swedish_holidays_fg (v1)")
+    print(f"  - trafikverket_traffic_event_fg (v2)")
 
-    return vehicle_fg, weather_fg, holiday_fg
+    return vehicle_fg, weather_fg, holiday_fg, traffic_fg
 
 
 def create_feature_view(fs, vehicle_fg, weather_fg, holiday_fg):
@@ -188,7 +205,83 @@ def create_feature_view(fs, vehicle_fg, weather_fg, holiday_fg):
     return feature_view
 
 
-def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg):
+def distance_m(lat1, lon1, lat2, lon2):
+    """Calculate distance in meters between two points."""
+    return haversine((lat1, lon1), (lat2, lon2), unit=Unit.METERS)
+
+
+def calculate_nearby_traffic_events(vehicle_df, traffic_df):
+    """
+    Calculate nearby traffic events for each vehicle trip.
+
+    For each trip, counts active traffic events within TRAFFIC_EVENT_RADIUS_M meters
+    of the trip's mean location during the trip's window_start time.
+
+    Returns DataFrame with has_nearby_event and num_nearby_traffic_events columns.
+    """
+    print("  Calculating nearby traffic events...")
+
+    if traffic_df is None or traffic_df.empty:
+        print("    No traffic data available, setting defaults")
+        vehicle_df["has_nearby_event"] = 0
+        vehicle_df["num_nearby_traffic_events"] = 0
+        return vehicle_df
+
+    # Ensure timestamps are comparable
+    if "window_start" in vehicle_df.columns:
+        vehicle_df["window_start"] = pd.to_datetime(vehicle_df["window_start"])
+    if "start_time" in traffic_df.columns:
+        traffic_df["start_time"] = pd.to_datetime(traffic_df["start_time"])
+    if "end_time" in traffic_df.columns:
+        traffic_df["end_time"] = pd.to_datetime(traffic_df["end_time"])
+
+    has_nearby = []
+    num_nearby = []
+
+    for idx, trip_row in vehicle_df.iterrows():
+        window_start = trip_row.get("window_start")
+        trip_lat = trip_row.get("lat_mean")
+        trip_lon = trip_row.get("lon_mean")
+
+        if pd.isna(trip_lat) or pd.isna(trip_lon) or pd.isna(window_start):
+            has_nearby.append(0)
+            num_nearby.append(0)
+            continue
+
+        # Find active traffic events at this time
+        active_events = traffic_df[
+            (traffic_df["start_time"] <= window_start) &
+            (traffic_df["end_time"] >= window_start)
+        ]
+
+        if active_events.empty:
+            has_nearby.append(0)
+            num_nearby.append(0)
+            continue
+
+        # Filter to events within radius
+        nearby_count = 0
+        for _, event in active_events.iterrows():
+            event_lat = event.get("latitude")
+            event_lon = event.get("longitude")
+            if pd.notna(event_lat) and pd.notna(event_lon):
+                dist = distance_m(trip_lat, trip_lon, event_lat, event_lon)
+                if dist <= TRAFFIC_EVENT_RADIUS_M:
+                    nearby_count += 1
+
+        has_nearby.append(1 if nearby_count > 0 else 0)
+        num_nearby.append(nearby_count)
+
+    vehicle_df["has_nearby_event"] = has_nearby
+    vehicle_df["num_nearby_traffic_events"] = num_nearby
+
+    nearby_trips = sum(has_nearby)
+    print(f"    {nearby_trips} trips ({100*nearby_trips/len(vehicle_df):.1f}%) have nearby traffic events")
+
+    return vehicle_df
+
+
+def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg):
     """
     Manually fetch and join data from feature groups.
     Use this if Feature View creation has issues.
@@ -211,6 +304,15 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg):
     print("  Reading swedish_holidays_fg...")
     holiday_df = holiday_fg.read()
     print(f"    {len(holiday_df)} rows")
+
+    # Fetch traffic data
+    print("  Reading trafikverket_traffic_event_fg...")
+    try:
+        traffic_df = traffic_fg.read()
+        print(f"    {len(traffic_df)} rows")
+    except Exception as e:
+        print(f"    Warning: Could not read traffic data: {e}")
+        traffic_df = None
 
     # Prepare for joining
     # Ensure date columns are comparable
@@ -242,6 +344,9 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg):
         how="left"
     )
 
+    # Calculate nearby traffic events
+    joined_df = calculate_nearby_traffic_events(joined_df, traffic_df)
+
     print(f"  Final joined dataset: {len(joined_df)} rows")
 
     return joined_df
@@ -266,7 +371,7 @@ def prepare_data(df, test_start_date=None, test_ratio=0.2):
     print(f"  Rows with valid target: {len(df)}")
 
     # Feature columns
-    feature_cols = VEHICLE_FEATURES + WEATHER_FEATURES + HOLIDAY_FEATURES
+    feature_cols = VEHICLE_FEATURES + WEATHER_FEATURES + HOLIDAY_FEATURES + TRAFFIC_FEATURES
 
     # Check which features exist
     available_features = [col for col in feature_cols if col in df.columns]
@@ -469,7 +574,7 @@ def register_model(mr, model, metrics, feature_view, model_dir, X_test):
         name=MODEL_NAME,
         metrics=metrics,
         feature_view=feature_view,
-        description="XGBoost Classifier for bus occupancy prediction (4 classes: 0-3)",
+        description="XGBoost Classifier for bus occupancy prediction (GTFS-RT classes 0-6)",
         input_example=X_test.iloc[:1].values,
     )
 
@@ -503,11 +608,11 @@ def run_training_pipeline(test_start_date=None, upload_model=True):
     project, fs, mr = connect_to_hopsworks()
 
     # Get feature groups
-    vehicle_fg, weather_fg, holiday_fg = get_feature_groups(fs)
+    vehicle_fg, weather_fg, holiday_fg, traffic_fg = get_feature_groups(fs)
 
     # Use manual data fetch and join (more reliable than Feature View for this use case)
     print("\nFetching and joining training data...")
-    df = fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg)
+    df = fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg)
     X_train, X_test, y_train, y_test = prepare_data(df, test_start_date)
     feature_view = None
 
@@ -531,7 +636,7 @@ def run_training_pipeline(test_start_date=None, upload_model=True):
                 hopsworks_model = mr.python.create_model(
                     name=MODEL_NAME,
                     metrics=metrics,
-                    description="XGBoost Classifier for bus occupancy prediction (4 classes: 0-3)",
+                    description="XGBoost Classifier for bus occupancy prediction (GTFS-RT classes 0-6)",
                     input_example=X_test.iloc[:1].values,
                 )
                 hopsworks_model.save(model_dir)
