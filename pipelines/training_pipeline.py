@@ -438,27 +438,52 @@ def prepare_data(df, test_start_date=None, test_ratio=0.2):
 
     print(f"  Using features: {available_features}")
 
-    # Sort by date for proper time-based split
+    # Derive date from window_start (more reliable than date column)
     if "window_start" in df.columns:
-        df = df.sort_values("window_start")
+        df["_split_date"] = pd.to_datetime(df["window_start"]).dt.date
     elif "date" in df.columns:
-        df = df.sort_values("date")
+        df["_split_date"] = pd.to_datetime(df["date"]).dt.date
+    else:
+        raise ValueError("No date or window_start column found for train/test split")
 
-    # Time-based split
+    # Sort by date for proper time-based split
+    df = df.sort_values("_split_date")
+
+    # Time-based split by complete dates (no data leakage within days)
     if test_start_date:
         test_start = pd.to_datetime(test_start_date).date()
-        train_mask = df["date"] < test_start
-        test_mask = df["date"] >= test_start
+        train_mask = df["_split_date"] < test_start
+        test_mask = df["_split_date"] >= test_start
 
         train_df = df[train_mask]
         test_df = df[test_mask]
         print(f"  Split by date: train < {test_start_date}, test >= {test_start_date}")
     else:
-        # Use last test_ratio of data for testing
-        split_idx = int(len(df) * (1 - test_ratio))
-        train_df = df.iloc[:split_idx]
-        test_df = df.iloc[split_idx:]
-        print(f"  Split by ratio: {1-test_ratio:.0%} train, {test_ratio:.0%} test")
+        # Find the date that gives us approximately (1 - test_ratio) of data
+        unique_dates = sorted(df["_split_date"].unique())
+        cumulative_counts = df.groupby("_split_date").size().cumsum()
+        total_rows = len(df)
+        target_train_rows = int(total_rows * (1 - test_ratio))
+
+        # Find split date
+        split_date = unique_dates[-1]  # default to last date
+        for date in unique_dates:
+            if cumulative_counts[date] >= target_train_rows:
+                split_date = date
+                break
+
+        train_mask = df["_split_date"] < split_date
+        test_mask = df["_split_date"] >= split_date
+
+        train_df = df[train_mask]
+        test_df = df[test_mask]
+        print(f"  Split by date: train < {split_date}, test >= {split_date}")
+        print(f"  (Target was {1-test_ratio:.0%}/{test_ratio:.0%}, got {len(train_df)/total_rows:.1%}/{len(test_df)/total_rows:.1%})")
+
+    # Clean up temp column
+    df.drop(columns=["_split_date"], inplace=True)
+    train_df = train_df.drop(columns=["_split_date"])
+    test_df = test_df.drop(columns=["_split_date"])
 
     print(f"  Train size: {len(train_df)}, Test size: {len(test_df)}")
 
