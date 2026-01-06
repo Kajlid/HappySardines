@@ -102,7 +102,7 @@ def load_model():
     # Check for API key before attempting connection
     api_key = os.environ.get("HOPSWORKS_API_KEY")
     if not api_key:
-        raise ValueError("HOPSWORKS_API_KEY environment variable not set. Please add it in Space settings.")
+        raise ValueError("HOPSWORKS_API_KEY not set - using mock predictions")
 
     try:
         import hopsworks
@@ -189,3 +189,39 @@ def predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
     confidence = float(probabilities[predicted_class])
 
     return predicted_class, confidence, probabilities.tolist()
+
+
+# Mock prediction for testing without Hopsworks
+def predict_occupancy_mock(lat, lon, hour, day_of_week, weather, holidays):
+    """
+    Mock prediction for testing UI without model.
+    """
+    # Simple heuristic based on time
+    if 7 <= hour <= 9 or 16 <= hour <= 18:
+        # Rush hour
+        if holidays.get("is_work_free") or holidays.get("is_red_day"):
+            predicted_class = 1  # Holiday rush hour = many seats
+        else:
+            predicted_class = 2 if hour < 8 or hour > 17 else 3  # Peak = standing
+    elif 10 <= hour <= 15:
+        predicted_class = 1  # Midday = many seats
+    else:
+        predicted_class = 0  # Early/late = empty
+
+    # Mock probabilities
+    probabilities = [0.1] * 7
+    probabilities[predicted_class] = 0.6
+    confidence = 0.6
+
+    return predicted_class, confidence, probabilities
+
+
+# For testing - use mock if model not available
+def get_predictor():
+    """Get the appropriate predictor function."""
+    try:
+        load_model()
+        return predict_occupancy
+    except Exception as e:
+        print(f"Using mock predictor: {e}")
+        return predict_occupancy_mock

@@ -1,44 +1,36 @@
 """
-HappySardines - Bus Occupancy Predictor UI
+HappySardines - Bus Occupancy Predictor UI (Streamlit version)
 
-A Gradio app that predicts how crowded buses are in Östergötland based on
-location, time, weather, and holidays.
+A Streamlit app with clickable map and heat map overlay for predicting
+bus crowding in Östergötland.
 """
 
+import streamlit as st
+
+# Page config - MUST be first Streamlit command
+st.set_page_config(
+    page_title="HappySardines",
+    page_icon="🐟",
+    layout="wide"
+)
+
 import os
-import gradio as gr
 import folium
-import pandas as pd
+from folium.plugins import HeatMap
+from streamlit_folium import st_folium
 import numpy as np
 from datetime import datetime, timedelta
 
 # Import prediction and data fetching modules
-from predictor import predict_occupancy, predict_occupancy_mock, OCCUPANCY_LABELS
+from predictor import predict_occupancy, load_model, OCCUPANCY_LABELS
 from weather import get_weather_for_prediction
 from holidays import get_holiday_features
 
-# Try to load model on startup, fall back to mock
-USE_MOCK = os.environ.get("USE_MOCK", "false").lower() == "true"
-
-if not USE_MOCK:
-    try:
-        from predictor import load_model
-        load_model()
-        print("Model loaded successfully - using real predictions")
-    except Exception as e:
-        print(f"Could not load model: {e}")
-        print("Using mock predictions for testing")
-        USE_MOCK = True
-
-# Select predictor function
-_predict_fn = predict_occupancy_mock if USE_MOCK else predict_occupancy
-
-# Default map center: Linköping
+# Constants
 DEFAULT_LAT = 58.4108
 DEFAULT_LON = 15.6214
-DEFAULT_ZOOM = 12
+DEFAULT_ZOOM = 10
 
-# Östergötland bounds (roughly)
 BOUNDS = {
     "min_lat": 57.8,
     "max_lat": 58.9,
@@ -46,301 +38,295 @@ BOUNDS = {
     "max_lon": 16.8
 }
 
+# Color scheme for occupancy levels
+OCCUPANCY_COLORS = {
+    0: "#22c55e",  # Empty - green
+    1: "#22c55e",  # Many seats - green
+    2: "#eab308",  # Few seats - yellow
+    3: "#f97316",  # Standing - orange
+    4: "#ef4444",  # Crushed - red
+    5: "#ef4444",  # Full - red
+    6: "#6b7280",  # Not accepting - gray
+}
 
-def create_map(lat=DEFAULT_LAT, lon=DEFAULT_LON, marker_lat=None, marker_lon=None):
-    """Create a Folium map with optional marker."""
+
+@st.cache_resource
+def get_model():
+    """Load model once and cache it."""
+    try:
+        return load_model()
+    except Exception as e:
+        st.error(f"Failed to load model: {e}")
+        return None
+
+
+def generate_heatmap_data(hour, day_of_week, weather, holidays):
+    """Generate heat map data by predicting crowding across a grid."""
+    model = get_model()
+    if model is None:
+        return []
+
+    # Create grid of points across Östergötland
+    lat_steps = 15
+    lon_steps = 20
+    lats = np.linspace(BOUNDS["min_lat"], BOUNDS["max_lat"], lat_steps)
+    lons = np.linspace(BOUNDS["min_lon"], BOUNDS["max_lon"], lon_steps)
+
+    heatmap_data = []
+
+    for lat in lats:
+        for lon in lons:
+            try:
+                pred_class, confidence, _ = predict_occupancy(
+                    lat=lat, lon=lon, hour=hour, day_of_week=day_of_week,
+                    weather=weather, holidays=holidays
+                )
+                # Weight by occupancy level (higher = more crowded = more intense)
+                intensity = pred_class / 5.0  # Normalize to 0-1
+                if intensity > 0.1:  # Only show if there's some crowding
+                    heatmap_data.append([lat, lon, intensity])
+            except Exception:
+                pass
+
+    return heatmap_data
+
+
+def create_map(selected_lat=None, selected_lon=None, show_heatmap=False,
+               heatmap_data=None):
+    """Create a Folium map with optional marker and heatmap."""
+    center_lat = selected_lat if selected_lat else DEFAULT_LAT
+    center_lon = selected_lon if selected_lon else DEFAULT_LON
+
     m = folium.Map(
-        location=[lat, lon],
+        location=[center_lat, center_lon],
         zoom_start=DEFAULT_ZOOM,
         tiles="CartoDB positron"
     )
 
-    # Add click instruction
-    if marker_lat is None:
-        folium.Marker(
-            [lat, lon],
-            popup="Click anywhere on the map to select a location",
-            icon=folium.Icon(color="gray", icon="info-sign")
+    # Add coverage area rectangle
+    folium.Rectangle(
+        bounds=[[BOUNDS["min_lat"], BOUNDS["min_lon"]],
+                [BOUNDS["max_lat"], BOUNDS["max_lon"]]],
+        color="#3388ff",
+        fill=False,
+        weight=2,
+        opacity=0.5,
+    ).add_to(m)
+
+    # Add heatmap if enabled
+    if show_heatmap and heatmap_data and len(heatmap_data) > 0:
+        HeatMap(
+            data=heatmap_data,
+            min_opacity=0.3,
+            radius=25,
+            blur=15,
         ).add_to(m)
-    else:
-        # Add user's selected marker
+
+    # Add marker if location selected
+    if selected_lat and selected_lon:
         folium.Marker(
-            [marker_lat, marker_lon],
-            popup=f"Selected: {marker_lat:.4f}, {marker_lon:.4f}",
-            icon=folium.Icon(color="blue", icon="map-marker", prefix="fa")
+            [selected_lat, selected_lon],
+            tooltip=f"Selected: {selected_lat:.4f}, {selected_lon:.4f}",
         ).add_to(m)
 
-    return m._repr_html_()
+    return m
 
 
-def parse_map_click(map_html, click_data):
-    """Parse click coordinates from map interaction."""
-    # This is a placeholder - Gradio's map handling varies by version
-    # We'll use a simpler approach with coordinate inputs
-    return None, None
-
-
-def make_prediction(lat, lon, date_choice, hour):
-    """
-    Make occupancy prediction for given inputs.
-
-    Returns formatted result HTML.
-    """
+def make_prediction(lat, lon, selected_datetime):
+    """Make prediction and return formatted result."""
     if lat is None or lon is None:
-        return create_result_card(
-            "Please select a location",
-            "Click on the map or enter coordinates to get a prediction.",
-            "gray",
-            None
-        )
+        return None, None, None
 
-    # Validate coordinates are in Östergötland
+    # Check bounds
     if not (BOUNDS["min_lat"] <= lat <= BOUNDS["max_lat"] and
             BOUNDS["min_lon"] <= lon <= BOUNDS["max_lon"]):
-        return create_result_card(
-            "Location outside coverage area",
-            "Please select a location within Östergötland.",
-            "gray",
-            None
-        )
-
-    # Determine date
-    today = datetime.now().date()
-    if date_choice == "Today":
-        selected_date = today
-    else:  # Tomorrow
-        selected_date = today + timedelta(days=1)
-
-    selected_datetime = datetime.combine(selected_date, datetime.min.time().replace(hour=int(hour)))
+        return None, None, "Location outside coverage area"
 
     try:
-        # Get weather forecast
         weather = get_weather_for_prediction(lat, lon, selected_datetime)
-
-        # Get holiday features
         holidays = get_holiday_features(selected_datetime)
 
-        # Make prediction
-        prediction, confidence, probabilities = _predict_fn(
-            lat=lat,
-            lon=lon,
-            hour=int(hour),
-            day_of_week=selected_date.weekday(),
+        pred_class, confidence, probs = predict_occupancy(
+            lat=lat, lon=lon,
+            hour=selected_datetime.hour,
+            day_of_week=selected_datetime.weekday(),
             weather=weather,
             holidays=holidays
         )
 
-        # Format result
-        label_info = OCCUPANCY_LABELS[prediction]
-
-        # Build context string
-        day_name = selected_date.strftime("%A")
-        day_type = "Holiday" if holidays.get("is_red_day") else ("Work-free day" if holidays.get("is_work_free") else "Regular workday")
-        temp = weather.get("temperature_2m", "?")
-
-        context = f"{temp:.0f}°C  •  {day_name}  •  {day_type}"
-
-        return create_result_card(
-            label_info["label"],
-            label_info["message"],
-            label_info["color"],
-            context,
-            confidence
-        )
-
+        return pred_class, confidence, {
+            "weather": weather,
+            "holidays": holidays,
+            "datetime": selected_datetime
+        }
     except Exception as e:
-        return create_result_card(
-            "Prediction failed",
-            f"Error: {str(e)}",
-            "gray",
-            None
-        )
+        return None, None, str(e)
 
 
-def create_result_card(title, message, color, context, confidence=None):
-    """Create HTML result card."""
-    color_map = {
-        "green": "#22c55e",
-        "yellow": "#eab308",
-        "orange": "#f97316",
-        "red": "#ef4444",
-        "gray": "#6b7280"
-    }
-    bg_color = color_map.get(color, "#6b7280")
+# Initialize session state
+if "selected_lat" not in st.session_state:
+    st.session_state.selected_lat = DEFAULT_LAT
+if "selected_lon" not in st.session_state:
+    st.session_state.selected_lon = DEFAULT_LON
 
-    confidence_html = ""
-    if confidence is not None:
-        confidence_html = f'<div style="font-size: 0.9em; opacity: 0.8;">Confidence: {confidence:.0%}</div>'
+# Header
+st.title("🐟 HappySardines")
+st.markdown("*How packed are buses in Östergötland?*")
 
-    context_html = ""
-    if context:
-        context_html = f'<div style="margin-top: 15px; font-size: 0.9em; opacity: 0.7;">{context}</div>'
+# Check if model is available
+model = get_model()
+if model is None:
+    st.error("⚠️ Could not load prediction model. Please check the configuration.")
+    st.stop()
 
-    return f"""
-    <div style="
-        background: linear-gradient(135deg, {bg_color}22, {bg_color}11);
-        border-left: 4px solid {bg_color};
-        border-radius: 12px;
-        padding: 24px;
-        margin: 10px 0;
-    ">
-        <div style="
-            font-size: 1.4em;
-            font-weight: 600;
-            color: {bg_color};
-            margin-bottom: 8px;
-        ">{title}</div>
-        <div style="
-            font-size: 1.1em;
-            color: #374151;
-            line-height: 1.5;
-        ">{message}</div>
-        {confidence_html}
-        {context_html}
-    </div>
-    """
+# Sidebar controls
+with st.sidebar:
+    st.header("Settings")
 
+    # Date/time selection
+    st.subheader("When?")
+    date_option = st.radio("Date", ["Today", "Tomorrow"], horizontal=True)
+    hour = st.slider("Hour", 5, 23, 8)
 
-def update_map_with_marker(lat, lon):
-    """Update map with new marker position."""
-    if lat is not None and lon is not None:
-        return create_map(lat, lon, lat, lon)
-    return create_map()
+    today = datetime.now().date()
+    selected_date = today if date_option == "Today" else today + timedelta(days=1)
+    selected_datetime = datetime.combine(selected_date, datetime.min.time().replace(hour=hour))
 
+    st.markdown(f"**{selected_datetime.strftime('%A, %B %d at %H:00')}**")
 
-# Custom CSS
-CUSTOM_CSS = """
-.main-title {
-    text-align: center;
-    margin-bottom: 0;
-}
-.subtitle {
-    text-align: center;
-    color: #6b7280;
-    margin-top: 5px;
-    margin-bottom: 20px;
-}
-"""
+    st.divider()
 
-# Build Gradio interface
-with gr.Blocks(title="HappySardines") as app:
+    # View mode
+    st.subheader("View Mode")
+    show_heatmap = st.toggle("Show Crowding Forecast", value=False,
+                              help="Display predicted crowding across the region")
 
-    # Header
-    gr.Markdown("# 🐟 HappySardines", elem_classes=["main-title"])
-    gr.Markdown("*How packed are buses in Östergötland?*", elem_classes=["subtitle"])
+    if show_heatmap:
+        st.info("🔥 Heat map shows predicted crowding levels. Red = busy, Green = quiet.")
 
-    with gr.Row():
-        # Left column: Map
-        with gr.Column(scale=2):
-            gr.Markdown("### Select Location")
-            gr.Markdown("Enter coordinates or use the map as reference:")
-
-            map_display = gr.HTML(value=create_map())
-
-            with gr.Row():
-                lat_input = gr.Number(
-                    label="Latitude",
-                    value=DEFAULT_LAT,
-                    precision=6,
-                    minimum=BOUNDS["min_lat"],
-                    maximum=BOUNDS["max_lat"]
-                )
-                lon_input = gr.Number(
-                    label="Longitude",
-                    value=DEFAULT_LON,
-                    precision=6,
-                    minimum=BOUNDS["min_lon"],
-                    maximum=BOUNDS["max_lon"]
+        if st.button("Generate Heat Map", type="primary"):
+            with st.spinner("Generating predictions across region..."):
+                weather = get_weather_for_prediction(DEFAULT_LAT, DEFAULT_LON, selected_datetime)
+                holidays = get_holiday_features(selected_datetime)
+                st.session_state.heatmap_data = generate_heatmap_data(
+                    hour, selected_date.weekday(), weather, holidays
                 )
 
-            update_map_btn = gr.Button("Update Map", variant="secondary", size="sm")
+    st.divider()
 
-        # Right column: Controls
-        with gr.Column(scale=1):
-            gr.Markdown("### When?")
-
-            date_choice = gr.Radio(
-                choices=["Today", "Tomorrow"],
-                value="Today",
-                label="Date"
-            )
-
-            hour_slider = gr.Slider(
-                minimum=5,
-                maximum=23,
-                value=8,
-                step=1,
-                label="Hour",
-                info="Select time of day (24h format)"
-            )
-
-            # Show selected time
-            time_display = gr.Markdown("**Selected: 08:00**")
-
-            predict_btn = gr.Button("🔮 Predict Crowding", variant="primary", size="lg")
-
-    # Result section
-    gr.Markdown("### Prediction")
-    result_display = gr.HTML(
-        value=create_result_card(
-            "Select location and time",
-            "Then click 'Predict Crowding' to see the forecast.",
-            "gray",
-            None
-        )
-    )
-
-    # About section
-    with gr.Accordion("About this tool", open=False):
-        gr.Markdown("""
+    # About
+    with st.expander("About this tool"):
+        st.markdown("""
         **How it works:**
 
-        This tool predicts typical bus crowding levels based on:
-        - **Location** - Different areas have different ridership patterns
-        - **Time** - Rush hours vs. off-peak
-        - **Day of week** - Weekdays vs. weekends
-        - **Weather** - Temperature, precipitation, etc.
-        - **Holidays** - Swedish red days and work-free days
+        This tool predicts bus crowding levels based on:
+        - 📍 Location
+        - 🕐 Time of day
+        - 📅 Day of week
+        - 🌡️ Weather conditions
+        - 🎉 Holidays
 
         **Data sources:**
-        - Historical bus occupancy data from Östgötatrafiken (GTFS-RT, Nov-Dec 2025)
-        - Weather forecasts from Open-Meteo
-        - Swedish holiday calendar from Svenska Dagar API
+        - Bus occupancy data from Östgötatrafiken
+        - Weather from Open-Meteo
+        - Holidays from Svenska Dagar API
 
-        **Limitations:**
-        - Predictions are based on historical patterns, not real-time data
-        - Accuracy varies by location and time
-        - The model predicts general area crowding, not specific bus lines
-
-        **Built for KTH ID2223 - Scalable Machine Learning and Deep Learning**
+        **Built for KTH ID2223**
         """)
 
-    # Event handlers
-    def update_time_display(hour):
-        return f"**Selected: {int(hour):02d}:00**"
+# Main content
+col1, col2 = st.columns([2, 1])
 
-    hour_slider.change(
-        fn=update_time_display,
-        inputs=[hour_slider],
-        outputs=[time_display]
+with col1:
+    st.subheader("📍 Click on the map to select a location")
+
+    # Get heatmap data if available
+    heatmap_data = st.session_state.get("heatmap_data", [])
+
+    # Create and display map
+    m = create_map(
+        selected_lat=st.session_state.selected_lat,
+        selected_lon=st.session_state.selected_lon,
+        show_heatmap=show_heatmap,
+        heatmap_data=heatmap_data
     )
 
-    update_map_btn.click(
-        fn=update_map_with_marker,
-        inputs=[lat_input, lon_input],
-        outputs=[map_display]
+    map_data = st_folium(
+        m,
+        height=500,
+        use_container_width=True,
+        key="map"
     )
 
-    predict_btn.click(
-        fn=make_prediction,
-        inputs=[lat_input, lon_input, date_choice, hour_slider],
-        outputs=[result_display]
+    # Handle map clicks
+    if map_data and map_data.get("last_clicked"):
+        clicked = map_data["last_clicked"]
+        st.session_state.selected_lat = clicked["lat"]
+        st.session_state.selected_lon = clicked["lng"]
+        st.rerun()
+
+with col2:
+    st.subheader("🔮 Prediction")
+
+    # Show selected coordinates
+    st.markdown(f"**Location:** {st.session_state.selected_lat:.4f}, {st.session_state.selected_lon:.4f}")
+
+    # Make prediction
+    pred_class, confidence, result = make_prediction(
+        st.session_state.selected_lat,
+        st.session_state.selected_lon,
+        selected_datetime
     )
 
+    if pred_class is not None:
+        label_info = OCCUPANCY_LABELS[pred_class]
+        color = OCCUPANCY_COLORS[pred_class]
 
-# For local testing
-if __name__ == "__main__":
-    app.launch(
-        theme=gr.themes.Soft(primary_hue="blue", secondary_hue="cyan"),
-        css=CUSTOM_CSS
-    )
+        # Result card
+        st.markdown(f"""
+        <div style="
+            background: linear-gradient(135deg, {color}22, {color}11);
+            border-left: 4px solid {color};
+            border-radius: 12px;
+            padding: 20px;
+            margin: 10px 0;
+        ">
+            <div style="font-size: 1.3em; font-weight: 600; color: {color};">
+                {label_info['icon']} {label_info['label']}
+            </div>
+            <div style="margin-top: 8px; color: #374151;">
+                {label_info['message']}
+            </div>
+            <div style="margin-top: 12px; font-size: 0.9em; opacity: 0.8;">
+                Confidence: {confidence:.0%}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Context info
+        if isinstance(result, dict):
+            weather = result["weather"]
+            holidays = result["holidays"]
+
+            day_type = "🎉 Holiday" if holidays.get("is_red_day") else (
+                "🏖️ Work-free day" if holidays.get("is_work_free") else "📅 Regular day"
+            )
+
+            st.markdown(f"""
+            **Conditions:**
+            - 🌡️ {weather.get('temperature_2m', '?'):.0f}°C
+            - {day_type}
+            - {selected_datetime.strftime('%A')}
+            """)
+
+    elif isinstance(result, str):
+        st.error(result)
+    else:
+        st.info("Click on the map to select a location")
+
+# Footer
+st.divider()
+st.markdown(
+    "<div style='text-align: center; opacity: 0.6;'>Built for KTH ID2223 - Scalable Machine Learning</div>",
+    unsafe_allow_html=True
+)
