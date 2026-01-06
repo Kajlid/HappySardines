@@ -16,16 +16,14 @@ Based on patterns from:
 
 import os
 import sys
-import json
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import hopsworks
 import pandas as pd
 import numpy as np
 from xgboost import XGBClassifier
-from haversine import haversine, Unit
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -106,16 +104,12 @@ HOLIDAY_FEATURES = [
     "is_day_before_holiday",
 ]
 
-TRAFFIC_FEATURES = [
-    "has_nearby_event",
-    "num_nearby_traffic_events",
-]
+# Traffic events were tested but provide no predictive value (0.02% match rate, zero importance)
+# See docs/traffic_events_analysis.md for details
+# TRAFFIC_FEATURES removed - they only added 75+ minutes to training time
 
 # Target variable
 TARGET = "occupancy_mode"
-
-# Distance threshold for "nearby" traffic events (meters)
-TRAFFIC_EVENT_RADIUS_M = 500
 
 
 def connect_to_hopsworks():
@@ -140,10 +134,9 @@ def get_feature_groups(fs):
     print("  - weather_hourly_fg (v1)", flush=True)
     holiday_fg = fs.get_feature_group(name="swedish_holidays_fg", version=1)
     print("  - swedish_holidays_fg (v1)", flush=True)
-    traffic_fg = fs.get_feature_group(name="trafikverket_traffic_event_fg", version=2)
-    print("  - trafikverket_traffic_event_fg (v2)", flush=True)
+    # Traffic events removed - see docs/traffic_events_analysis.md
 
-    return vehicle_fg, weather_fg, holiday_fg, traffic_fg
+    return vehicle_fg, weather_fg, holiday_fg
 
 
 def create_feature_view(fs, vehicle_fg, weather_fg, holiday_fg):
@@ -206,136 +199,7 @@ def create_feature_view(fs, vehicle_fg, weather_fg, holiday_fg):
     return feature_view
 
 
-def distance_m(lat1, lon1, lat2, lon2):
-    """Calculate distance in meters between two points."""
-    return haversine((lat1, lon1), (lat2, lon2), unit=Unit.METERS)
-
-
-def calculate_nearby_traffic_events(vehicle_df, traffic_df):
-    """
-    Calculate nearby traffic events for each vehicle trip (optimized version).
-
-    Uses vectorized operations and date-based bucketing to avoid O(n²) complexity.
-    For each trip, counts active traffic events within TRAFFIC_EVENT_RADIUS_M meters
-    of the trip's mean location during the trip's window_start time.
-
-    Returns DataFrame with has_nearby_event and num_nearby_traffic_events columns.
-    """
-    print("  Calculating nearby traffic events (optimized)...")
-
-    if traffic_df is None or traffic_df.empty:
-        print("    No traffic data available, setting defaults")
-        vehicle_df["has_nearby_event"] = 0
-        vehicle_df["num_nearby_traffic_events"] = 0
-        return vehicle_df
-
-    # Ensure timestamps are comparable
-    vehicle_df = vehicle_df.copy()
-    traffic_df = traffic_df.copy()
-
-    if "window_start" in vehicle_df.columns:
-        vehicle_df["window_start"] = pd.to_datetime(vehicle_df["window_start"])
-    if "start_time" in traffic_df.columns:
-        traffic_df["start_time"] = pd.to_datetime(traffic_df["start_time"])
-    if "end_time" in traffic_df.columns:
-        traffic_df["end_time"] = pd.to_datetime(traffic_df["end_time"])
-
-    # Filter traffic events to only those with valid coordinates
-    traffic_df = traffic_df.dropna(subset=["latitude", "longitude", "start_time", "end_time"])
-
-    if traffic_df.empty:
-        print("    No valid traffic events with coordinates")
-        vehicle_df["has_nearby_event"] = 0
-        vehicle_df["num_nearby_traffic_events"] = 0
-        return vehicle_df
-
-    print(f"    Processing {len(vehicle_df)} trips against {len(traffic_df)} traffic events...")
-
-    # Get date range from vehicle data
-    vehicle_df["_date"] = vehicle_df["window_start"].dt.date
-
-    # Initialize result columns
-    vehicle_df["has_nearby_event"] = 0
-    vehicle_df["num_nearby_traffic_events"] = 0
-
-    # Process by date to reduce comparisons
-    unique_dates = vehicle_df["_date"].unique()
-    total_nearby = 0
-
-    for i, date in enumerate(unique_dates):
-        if i % 10 == 0:
-            print(f"    Processing date {i+1}/{len(unique_dates)}...")
-
-        # Get trips for this date
-        date_mask = vehicle_df["_date"] == date
-        date_trips = vehicle_df.loc[date_mask]
-
-        if date_trips.empty:
-            continue
-
-        # Convert date to datetime for comparison (must be tz-aware to match traffic_df)
-        date_start = pd.Timestamp(date, tz='UTC')
-        date_end = date_start + pd.Timedelta(days=1)
-
-        # Get traffic events that could be active on this date
-        # Event is potentially active if: start_time <= end_of_day AND end_time >= start_of_day
-        active_mask = (traffic_df["start_time"] <= date_end) & (traffic_df["end_time"] >= date_start)
-        day_events = traffic_df.loc[active_mask]
-
-        if day_events.empty:
-            continue
-
-        # For each trip on this date, check against day's events
-        for idx in date_trips.index:
-            trip_time = vehicle_df.at[idx, "window_start"]
-            trip_lat = vehicle_df.at[idx, "lat_mean"]
-            trip_lon = vehicle_df.at[idx, "lon_mean"]
-
-            if pd.isna(trip_lat) or pd.isna(trip_lon) or pd.isna(trip_time):
-                continue
-
-            # Filter to events active at this specific time
-            time_mask = (day_events["start_time"] <= trip_time) & (day_events["end_time"] >= trip_time)
-            active_events = day_events.loc[time_mask]
-
-            if active_events.empty:
-                continue
-
-            # Vectorized distance calculation using haversine formula
-            event_lats = active_events["latitude"].values
-            event_lons = active_events["longitude"].values
-
-            # Calculate distances using numpy (approximate haversine)
-            # Convert to radians
-            lat1_rad = np.radians(trip_lat)
-            lon1_rad = np.radians(trip_lon)
-            lat2_rad = np.radians(event_lats)
-            lon2_rad = np.radians(event_lons)
-
-            # Haversine formula
-            dlat = lat2_rad - lat1_rad
-            dlon = lon2_rad - lon1_rad
-            a = np.sin(dlat/2)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon/2)**2
-            c = 2 * np.arcsin(np.sqrt(a))
-            distances = 6371000 * c  # Earth radius in meters
-
-            # Count nearby events
-            nearby_count = np.sum(distances <= TRAFFIC_EVENT_RADIUS_M)
-
-            if nearby_count > 0:
-                vehicle_df.at[idx, "has_nearby_event"] = 1
-                vehicle_df.at[idx, "num_nearby_traffic_events"] = int(nearby_count)
-                total_nearby += 1
-
-    # Clean up temp column
-    vehicle_df.drop(columns=["_date"], inplace=True)
-
-    print(f"    {total_nearby} trips ({100*total_nearby/len(vehicle_df):.1f}%) have nearby traffic events")
-
-    return vehicle_df
-
-
-def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg):
+def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg):
     """
     Manually fetch and join data from feature groups.
     Use this if Feature View creation has issues.
@@ -360,15 +224,6 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg):
     print("  Reading swedish_holidays_fg...", flush=True)
     holiday_df = holiday_fg.read()
     print(f"    {len(holiday_df)} rows", flush=True)
-
-    # Fetch traffic data
-    print("  Reading trafikverket_traffic_event_fg...", flush=True)
-    try:
-        traffic_df = traffic_fg.read()
-        print(f"    {len(traffic_df)} rows", flush=True)
-    except Exception as e:
-        print(f"    Warning: Could not read traffic data: {e}", flush=True)
-        traffic_df = None
 
     # Prepare for joining
     # Ensure date columns are comparable
@@ -400,9 +255,6 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg):
         how="left"
     )
 
-    # Calculate nearby traffic events
-    joined_df = calculate_nearby_traffic_events(joined_df, traffic_df)
-
     print(f"  Final joined dataset: {len(joined_df)} rows", flush=True)
 
     return joined_df
@@ -427,7 +279,7 @@ def prepare_data(df, test_start_date=None, test_ratio=0.2):
     print(f"  Rows with valid target: {len(df)}")
 
     # Feature columns
-    feature_cols = VEHICLE_FEATURES + WEATHER_FEATURES + HOLIDAY_FEATURES + TRAFFIC_FEATURES
+    feature_cols = VEHICLE_FEATURES + WEATHER_FEATURES + HOLIDAY_FEATURES
 
     # Check which features exist
     available_features = [col for col in feature_cols if col in df.columns]
@@ -689,11 +541,11 @@ def run_training_pipeline(test_start_date=None, upload_model=True):
     project, fs, mr = connect_to_hopsworks()
 
     # Get feature groups
-    vehicle_fg, weather_fg, holiday_fg, traffic_fg = get_feature_groups(fs)
+    vehicle_fg, weather_fg, holiday_fg = get_feature_groups(fs)
 
     # Use manual data fetch and join (more reliable than Feature View for this use case)
     print("\nFetching and joining training data...")
-    df = fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg, traffic_fg)
+    df = fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg)
     X_train, X_test, y_train, y_test = prepare_data(df, test_start_date)
     feature_view = None
 

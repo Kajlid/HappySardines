@@ -1,0 +1,10 @@
+gradio==4.44.0
+huggingface_hub>=0.24.0,<1.0.0
+hopsworks==4.2.*
+xgboost>=2.0.0
+scikit-learn
+pandas
+numpy
+requests
+python-dotenv
+folium>=0.15.0

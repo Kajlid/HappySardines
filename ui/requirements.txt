@@ -1,0 +1,10 @@
+streamlit>=1.28.0
+streamlit-folium==0.17.0
+folium==0.15.1
+hopsworks==4.2.*
+xgboost>=2.0.0
+scikit-learn
+pandas
+numpy
+requests
+python-dotenv
