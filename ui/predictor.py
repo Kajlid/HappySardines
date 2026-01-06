@@ -7,6 +7,9 @@ Loads the XGBoost model from Hopsworks Model Registry and makes predictions.
 import os
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Global model cache
 _model = None
@@ -61,9 +64,9 @@ OCCUPANCY_LABELS = {
 # Feature order expected by the model
 # Must match training pipeline exactly
 FEATURE_ORDER = [
-    "avg_speed",
+    "trip_id",
+    "vehicle_id",
     "max_speed",
-    "speed_std",
     "n_positions",
     "lat_mean",
     "lon_mean",
@@ -73,6 +76,8 @@ FEATURE_ORDER = [
     "precipitation",
     "cloud_cover",
     "wind_speed_10m",
+    "snowfall", 
+    "rain",  
     "is_work_free",
     "is_red_day",
     "is_day_before_holiday",
@@ -81,9 +86,7 @@ FEATURE_ORDER = [
 # Default values for vehicle features (we don't have real-time vehicle data)
 # These are approximate averages from the training data
 DEFAULT_VEHICLE_FEATURES = {
-    "avg_speed": 20.0,      # typical urban bus speed (km/h)
     "max_speed": 45.0,      # typical max speed
-    "speed_std": 12.0,      # typical speed variation
     "n_positions": 30,      # typical GPS points per trip window
 }
 
@@ -101,6 +104,7 @@ def load_model():
 
     # Check for API key before attempting connection
     api_key = os.environ.get("HOPSWORKS_API_KEY")
+    project = os.environ.get("HOPSWORKS_PROJECT")
     if not api_key:
         raise ValueError("HOPSWORKS_API_KEY environment variable not set. Please add it in Space settings.")
 
@@ -109,11 +113,11 @@ def load_model():
         from xgboost import XGBClassifier
 
         print("Connecting to Hopsworks...")
-        project = hopsworks.login(api_key_value=api_key)
+        project = hopsworks.login(project=project, api_key_value=api_key)
         mr = project.get_model_registry()
 
         print("Fetching model from registry...")
-        model_entry = mr.get_model("occupancy_xgboost_model", version=None)  # Latest version
+        model_entry = mr.get_model("occupancy_xgboost_model_new", version=None)  # Latest version
 
         print(f"Downloading model version {model_entry.version}...")
         model_dir = model_entry.download()
@@ -153,9 +157,9 @@ def predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
     # Assemble feature vector
     features = {
         # Vehicle features - use defaults
-        "avg_speed": DEFAULT_VEHICLE_FEATURES["avg_speed"],
+        "trip_id": 0,         # placeholder
+        "vehicle_id": 0,      # placeholder
         "max_speed": DEFAULT_VEHICLE_FEATURES["max_speed"],
-        "speed_std": DEFAULT_VEHICLE_FEATURES["speed_std"],
         "n_positions": DEFAULT_VEHICLE_FEATURES["n_positions"],
 
         # Location
@@ -171,6 +175,8 @@ def predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
         "precipitation": weather.get("precipitation", 0.0),
         "cloud_cover": weather.get("cloud_cover", 50.0),
         "wind_speed_10m": weather.get("wind_speed_10m", 5.0),
+        "snowfall": weather.get("snowfall", 0.0), 
+        "rain": weather.get("rain", 0.0),             
 
         # Holidays (convert bool to int)
         "is_work_free": int(holidays.get("is_work_free", False)),
