@@ -23,7 +23,7 @@ defaults:
 jobs:
   train-model:
     runs-on: ubuntu-latest
-    timeout-minutes: 180    # allow time for traffic event calculation
+    timeout-minutes: 30    # ~5 min typical (traffic events removed)
 
     steps:
       - name: Checkout repository
