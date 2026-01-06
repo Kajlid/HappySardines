@@ -4,14 +4,10 @@ Training Pipeline for HappySardines Bus Occupancy Prediction
 This pipeline:
 1. Connects to Hopsworks Feature Store
 2. Creates a Feature View joining vehicle, weather, and holiday data
-3. Splits data by date (time-series appropriate)
+3. Splits data by date
 4. Trains an XGBoost Classifier for occupancy prediction (7 GTFS-RT classes: 0-6)
 5. Evaluates with weighted metrics for class imbalance
 6. Registers the model in Hopsworks Model Registry with lineage
-
-Based on patterns from:
-- mlfs-book (course textbook): Feature View + Model Registry patterns
-- WheelyFunTimes: XGBoost Classifier for bus occupancy
 """
 
 import os
@@ -43,9 +39,11 @@ if parent_dir not in sys.path:
 load_dotenv()
 
 # Configuration
-MODEL_NAME = "occupancy_xgboost_model"
+MODEL_NAME = "occupancy_xgboost_model_new"
 FEATURE_VIEW_NAME = "occupancy_fv"
 FEATURE_VIEW_VERSION = 1
+test_start_string = os.getenv("TEST_START_DATE")
+test_start_date = pd.to_datetime(test_start_string).date()
 
 # XGBoost hyperparameters
 # Using softprob to get probabilities for threshold tuning
@@ -74,13 +72,15 @@ CLASS_WEIGHT_MULTIPLIER = {
     1: 2.0,   # MANY_SEATS (26%) - slight boost
     2: 10.0,  # FEW_SEATS (1%) - significant boost
     3: 20.0,  # STANDING (0.4%) - heavy boost
-    4: 25.0,  # CRUSHED_STANDING - not observed yet
+    4: 30.0,  # CRUSHED_STANDING - not observed yet
     5: 30.0,  # FULL - not observed yet
-    6: 1.0,   # NOT_ACCEPTING_PASSENGERS - not observed yet
+    6: 30.0,   # NOT_ACCEPTING_PASSENGERS - not observed yet
 }
 
 # Features to use for training
 VEHICLE_FEATURES = [
+    "trip_id",
+    "vehicle_id",
     "avg_speed",
     "max_speed",
     "speed_std",
@@ -96,6 +96,8 @@ WEATHER_FEATURES = [
     "precipitation",
     "cloud_cover",
     "wind_speed_10m",
+    "rain",
+    "snowfall"
 ]
 
 HOLIDAY_FEATURES = [
@@ -111,11 +113,13 @@ HOLIDAY_FEATURES = [
 # Target variable
 TARGET = "occupancy_mode"
 
+hopsworks_key = os.getenv("HOPSWORKS_API_KEY")
+hopsworks_project = os.getenv("HOPSWORKS_PROJECT")
 
 def connect_to_hopsworks():
     """Connect to Hopsworks and return project, feature store, and model registry."""
     print("Connecting to Hopsworks...", flush=True)
-    project = hopsworks.login()
+    project = hopsworks.login(project=hopsworks_project, api_key_value=hopsworks_key)
     print(f"Connected to project: {project.name}", flush=True)
     fs = project.get_feature_store()
     print("Got feature store", flush=True)
@@ -163,7 +167,7 @@ def create_feature_view(fs, vehicle_fg, weather_fg, holiday_fg):
 
     weather_query = weather_fg.select([
         "date", "hour",
-        "temperature_2m", "precipitation", "cloud_cover", "wind_speed_10m",
+        "temperature_2m", "precipitation", "cloud_cover", "wind_speed_10m", "rain", "snowfall"
     ])
 
     holiday_query = holiday_fg.select([
@@ -260,7 +264,7 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg):
     return joined_df
 
 
-def prepare_data(df, test_start_date=None, test_ratio=0.2):
+def prepare_data(df, feature_view, test_start_date=None):
     """
     Prepare training and test data with time-based split.
 
@@ -279,71 +283,17 @@ def prepare_data(df, test_start_date=None, test_ratio=0.2):
     print(f"  Rows with valid target: {len(df)}")
 
     # Feature columns
-    feature_cols = VEHICLE_FEATURES + WEATHER_FEATURES + HOLIDAY_FEATURES
+    # feature_cols = VEHICLE_FEATURES + WEATHER_FEATURES + HOLIDAY_FEATURES
 
-    # Check which features exist
-    available_features = [col for col in feature_cols if col in df.columns]
-    missing_features = [col for col in feature_cols if col not in df.columns]
+    # Temporal train test split
+    X_train, X_test, y_train, y_test = feature_view.train_test_split(
+        test_start=test_start_date
+    )
 
-    if missing_features:
-        print(f"  Warning: Missing features: {missing_features}")
-
-    print(f"  Using features: {available_features}")
-
-    # Derive date from window_start (more reliable than date column)
-    if "window_start" in df.columns:
-        df["_split_date"] = pd.to_datetime(df["window_start"]).dt.date
-    elif "date" in df.columns:
-        df["_split_date"] = pd.to_datetime(df["date"]).dt.date
-    else:
-        raise ValueError("No date or window_start column found for train/test split")
-
-    # Sort by date for proper time-based split
-    df = df.sort_values("_split_date")
-
-    # Time-based split by complete dates (no data leakage within days)
-    if test_start_date:
-        test_start = pd.to_datetime(test_start_date).date()
-        train_mask = df["_split_date"] < test_start
-        test_mask = df["_split_date"] >= test_start
-
-        train_df = df[train_mask]
-        test_df = df[test_mask]
-        print(f"  Split by date: train < {test_start_date}, test >= {test_start_date}")
-    else:
-        # Find the date that gives us approximately (1 - test_ratio) of data
-        unique_dates = sorted(df["_split_date"].unique())
-        cumulative_counts = df.groupby("_split_date").size().cumsum()
-        total_rows = len(df)
-        target_train_rows = int(total_rows * (1 - test_ratio))
-
-        # Find split date
-        split_date = unique_dates[-1]  # default to last date
-        for date in unique_dates:
-            if cumulative_counts[date] >= target_train_rows:
-                split_date = date
-                break
-
-        train_mask = df["_split_date"] < split_date
-        test_mask = df["_split_date"] >= split_date
-
-        train_df = df[train_mask]
-        test_df = df[test_mask]
-        print(f"  Split by date: train < {split_date}, test >= {split_date}")
-        print(f"  (Target was {1-test_ratio:.0%}/{test_ratio:.0%}, got {len(train_df)/total_rows:.1%}/{len(test_df)/total_rows:.1%})")
-
-    # Clean up temp column
-    df.drop(columns=["_split_date"], inplace=True)
-    train_df = train_df.drop(columns=["_split_date"])
-    test_df = test_df.drop(columns=["_split_date"])
-
-    print(f"  Train size: {len(train_df)}, Test size: {len(test_df)}")
-
-    # Extract features and target
-    X_train = train_df[available_features].copy()
-    X_test = test_df[available_features].copy()
-    y_train = train_df[TARGET].astype(int).copy()
-    y_test = test_df[TARGET].astype(int).copy()
+    print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
+    
+    print(X_train.columns)
+    print(X_test.columns)
 
     # Fill missing values
     X_train = X_train.fillna(X_train.median())
@@ -354,6 +304,15 @@ def prepare_data(df, test_start_date=None, test_ratio=0.2):
         if col in X_train.columns:
             X_train[col] = X_train[col].astype(int)
             X_test[col] = X_test[col].astype(int)
+            
+    X_train['trip_id'] = X_train['trip_id'].astype(int)
+    X_train['vehicle_id'] = X_train['vehicle_id'].astype(int)
+    X_test['trip_id'] = X_test['trip_id'].astype(int)
+    X_test['vehicle_id'] = X_test['vehicle_id'].astype(int)
+    
+    # Dropping features that had less than 0.02 in feature importance in a test run
+    X_features = X_train.drop(columns=['speed_std', 'avg_speed'])            
+    X_test_features = X_test.drop(columns=['speed_std', 'avg_speed']) 
 
     # Class distribution
     print(f"\n  Class distribution (train):")
@@ -362,26 +321,29 @@ def prepare_data(df, test_start_date=None, test_ratio=0.2):
         pct = count / len(y_train) * 100
         print(f"    Class {cls}: {count} ({pct:.1f}%)")
 
-    return X_train, X_test, y_train, y_test
+    return X_features, X_test_features, y_train, y_test
 
 
+MAX_WEIGHT = 50.0
+ALL_POSSIBLE_CLASSES = np.array([0, 1, 2, 3, 4, 5, 6])
 def compute_sample_weights(y_train):
     """Compute sample weights to handle class imbalance with custom multipliers."""
     from sklearn.utils.class_weight import compute_class_weight
 
-    classes = np.unique(y_train)
-    base_weights = compute_class_weight('balanced', classes=classes, y=y_train)
-    base_weight_dict = dict(zip(classes, base_weights))
+    present_classes = np.unique(y_train)
+    base_weights = compute_class_weight('balanced', classes=present_classes, y=y_train)
+    base_weight_dict = dict(zip(present_classes, base_weights))
 
     # Apply additional multipliers for severe imbalance
     weight_dict = {}
-    for cls in classes:
+    for cls in ALL_POSSIBLE_CLASSES:
         multiplier = CLASS_WEIGHT_MULTIPLIER.get(cls, 1.0)
-        weight_dict[cls] = base_weight_dict[cls] * multiplier
+        weight_dict[cls] = min(base_weight_dict.get(cls, 0) * multiplier, MAX_WEIGHT)  # 0 if cls not in y_train
 
-    print(f"  Base class weights: {base_weight_dict}")
-    print(f"  Adjusted class weights: {weight_dict}")
+    print(f"  Base class weights (present in y_train): {base_weight_dict}")
+    print(f"  Adjusted class weights (all possible classes): {weight_dict}")
 
+    # Assign sample weights only for rows actually in y_train
     sample_weights = np.array([weight_dict[y] for y in y_train])
     return sample_weights
 
@@ -402,6 +364,8 @@ def train_model(X_train, y_train, use_class_weights=True):
     print("  Training complete!")
     return model
 
+def ordinal_mae(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred))
 
 def evaluate_model(model, X_test, y_test):
     """Evaluate model and return metrics."""
@@ -413,6 +377,7 @@ def evaluate_model(model, X_test, y_test):
 
     # Calculate metrics (weighted for class imbalance)
     accuracy = accuracy_score(y_test, y_pred)
+    ordinal_mae_val = ordinal_mae(y_test, y_pred)
     precision = precision_score(y_test, y_pred, average="weighted", zero_division=0)
     recall = recall_score(y_test, y_pred, average="weighted", zero_division=0)
     f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
@@ -422,6 +387,7 @@ def evaluate_model(model, X_test, y_test):
 
     metrics = {
         "accuracy": float(accuracy),
+        "ordinal_mae": float(ordinal_mae_val),
         "precision_weighted": float(precision),
         "recall_weighted": float(recall),
         "f1_weighted": float(f1),
@@ -433,6 +399,7 @@ def evaluate_model(model, X_test, y_test):
 
     print(f"\n  Results:")
     print(f"    Accuracy:  {accuracy:.4f}")
+    print(f"    Ordinal MAE:  {ordinal_mae_val:.4f}")
     print(f"    Precision: {precision:.4f} (weighted)")
     print(f"    Recall:    {recall:.4f} (weighted)")
     print(f"    F1 Score:  {f1:.4f} (weighted)")
@@ -546,8 +513,8 @@ def run_training_pipeline(test_start_date=None, upload_model=True):
     # Use manual data fetch and join (more reliable than Feature View for this use case)
     print("\nFetching and joining training data...")
     df = fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg)
-    X_train, X_test, y_train, y_test = prepare_data(df, test_start_date)
-    feature_view = None
+    feature_view = create_feature_view(fs, vehicle_fg, weather_fg, holiday_fg)
+    X_train, X_test, y_train, y_test = prepare_data(df, feature_view, test_start_date)
 
     # Train model
     model = train_model(X_train, y_train)
