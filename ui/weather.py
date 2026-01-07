@@ -16,6 +16,8 @@ WEATHER_VARIABLES = [
     "precipitation",
     "cloud_cover",
     "wind_speed_10m",
+    "rain",
+    "snowfall"
 ]
 
 
@@ -89,6 +91,8 @@ def get_weather_for_prediction(lat: float, lon: float, target_datetime: datetime
             "precipitation": hourly.get("precipitation", [None])[idx] or 0.0,
             "cloud_cover": hourly.get("cloud_cover", [None])[idx] or 50.0,
             "wind_speed_10m": hourly.get("wind_speed_10m", [None])[idx] or 5.0,
+            "rain": hourly.get("rain", [None])[idx] or 0.0,
+            "snowfall": hourly.get("snowfall", [None])[idx] or 0.0,
         }
 
     except Exception as e:
@@ -103,4 +107,6 @@ def _default_weather() -> dict:
         "precipitation": 0.0,
         "cloud_cover": 50.0,
         "wind_speed_10m": 5.0,
+        "rain": 0.0,
+        "snowfall": 0.0
     }

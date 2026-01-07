@@ -23,7 +23,7 @@ defaults:
 jobs:
   train-model:
     runs-on: ubuntu-latest
-    timeout-minutes: 30    # ~5 min typical (traffic events removed)
+    # timeout-minutes: 30    # ~5 min typical (traffic events removed)
 
     steps:
       - name: Checkout repository
@@ -50,4 +50,5 @@ jobs:
           UPLOAD_MODEL: ${{ inputs.upload_model }}
 
         run: |
-            python -u pipelines/run_training.py
+            cd pipelines
+            jupyter nbconvert --to notebook --execute training_pipeline.ipynb
