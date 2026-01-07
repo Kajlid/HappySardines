@@ -20,6 +20,7 @@ import folium
 from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import numpy as np
+import pandas as pd
 from datetime import datetime, timedelta
 
 # Import prediction and data fetching modules
@@ -74,8 +75,67 @@ def load_precomputed_heatmaps():
 
 precomputed_heatmaps = load_precomputed_heatmaps()
 
-def generate_heatmap_data(hour, day_of_week, weather, holidays):
-    """Generate heat map data by predicting crowding across a grid."""
+def fetch_precomputed_heatmap(target_datetime):
+    """
+    Try to fetch pre-computed predictions from Hopsworks feature store.
+    Returns None if not available, falling back to on-demand prediction.
+    """
+    try:
+        import hopsworks
+        api_key = os.environ.get("HOPSWORKS_API_KEY")
+        if not api_key:
+            return None
+
+        project = hopsworks.login(api_key_value=api_key)
+        fs = project.get_feature_store()
+
+        # Try to get the feature group
+        try:
+            heatmap_fg = fs.get_feature_group("heatmap_predictions_fg", version=1)
+        except Exception:
+            return None  # Feature group doesn't exist yet
+
+        # Query predictions for the target hour
+        target_hour = target_datetime.replace(minute=0, second=0, microsecond=0)
+
+        # Read recent predictions
+        df = heatmap_fg.read()
+        if df.empty:
+            return None
+
+        # Filter to target hour
+        df["prediction_time"] = pd.to_datetime(df["prediction_time"])
+        df = df[df["prediction_time"] == target_hour]
+
+        if df.empty:
+            return None
+
+        # Convert to heatmap format
+        heatmap_data = []
+        for _, row in df.iterrows():
+            intensity = row["predicted_class"] / 5.0
+            if intensity > 0.1:
+                heatmap_data.append([row["lat"], row["lon"], intensity])
+
+        return heatmap_data if heatmap_data else None
+
+    except Exception as e:
+        print(f"Failed to fetch precomputed heatmap: {e}")
+        return None
+
+
+def generate_heatmap_data(hour, day_of_week, weather, holidays, target_datetime=None):
+    """
+    Generate heat map data by predicting crowding across a grid.
+    First tries to fetch pre-computed predictions, falls back to on-demand.
+    """
+    # Try pre-computed predictions first (faster)
+    if target_datetime:
+        precomputed = fetch_precomputed_heatmap(target_datetime)
+        if precomputed:
+            return precomputed
+
+    # Fall back to on-demand prediction
     model = get_model()
     if model is None:
         return []
@@ -257,12 +317,14 @@ with st.sidebar:
     if show_heatmap:
         st.info("🔥 Heat map shows predicted crowding levels. Red = busy, Green = quiet.")
 
-        with st.spinner("Generating predictions across region..."):
-            weather = get_weather_for_prediction(DEFAULT_LAT, DEFAULT_LON, selected_datetime)
-            holidays = get_holiday_features(selected_datetime)
-            st.session_state.heatmap_data = generate_heatmap_data(
-                hour, selected_date.weekday(), weather, holidays
-            )
+        if st.button("Generate Heat Map", type="primary"):
+            with st.spinner("Generating predictions across region..."):
+                weather = get_weather_for_prediction(DEFAULT_LAT, DEFAULT_LON, selected_datetime)
+                holidays = get_holiday_features(selected_datetime)
+                st.session_state.heatmap_data = generate_heatmap_data(
+                    hour, selected_date.weekday(), weather, holidays,
+                    target_datetime=selected_datetime
+                )
 
     st.divider()
 
