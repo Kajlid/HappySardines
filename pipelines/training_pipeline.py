@@ -335,11 +335,12 @@ def prepare_data(df, test_start_date=None, test_ratio=0.2):
             X_train[col] = X_train[col].astype(int)
             X_test[col] = X_test[col].astype(int)
 
-    # Convert ID columns to int
+    # Convert ID columns to int (handle empty strings and NaN)
     for col in ['trip_id', 'vehicle_id']:
         if col in X_train.columns:
-            X_train[col] = X_train[col].astype(int)
-            X_test[col] = X_test[col].astype(int)
+            # Replace empty strings with NaN, then fill with 0, then convert
+            X_train[col] = pd.to_numeric(X_train[col], errors='coerce').fillna(0).astype(int)
+            X_test[col] = pd.to_numeric(X_test[col], errors='coerce').fillna(0).astype(int)
 
     # Class distribution
     print(f"\n  Class distribution (train):")
