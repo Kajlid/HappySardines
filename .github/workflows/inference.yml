@@ -1,0 +1,56 @@
+name: inference-pipeline
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # Run daily at 06:00 UTC (07:00 CET)
+  workflow_dispatch:      # manual trigger
+    inputs:
+      hours_ahead:
+        description: 'Number of hours to predict ahead'
+        required: false
+        default: '48'
+        type: string
+      upload_predictions:
+        description: 'Upload predictions to Hopsworks'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+defaults:
+  run:
+    working-directory: .
+
+jobs:
+  generate-predictions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
+
+      - name: Run inference pipeline
+        env:
+          TZ: UTC
+          PYTHONUNBUFFERED: "1"
+          HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
+          HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
+          HOURS_AHEAD: ${{ inputs.hours_ahead || '48' }}
+          UPLOAD_PREDICTIONS: ${{ inputs.upload_predictions || 'true' }}
+
+        run: |
+            python -u pipelines/run_inference.py

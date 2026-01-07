@@ -6,7 +6,7 @@ bus crowding in Östergötland.
 """
 
 import streamlit as st
-import pickle
+import json
 
 # Page config - MUST be first Streamlit command
 st.set_page_config(
@@ -17,7 +17,6 @@ st.set_page_config(
 
 import os
 import folium
-from folium.plugins import HeatMap
 from streamlit_folium import st_folium
 import numpy as np
 from datetime import datetime, timedelta
@@ -27,20 +26,23 @@ from predictor import predict_occupancy, load_model, OCCUPANCY_LABELS
 from weather import get_weather_for_prediction
 from holidays import get_holiday_features
 from trip_info import load_static_trip_info, find_nearest_trip, load_static_stops_info, find_closest_stop
+from contours import load_contours_from_file, grid_to_contour_geojson
 
 # Constants
 DEFAULT_LAT = 58.4108
 DEFAULT_LON = 15.6214
-DEFAULT_ZOOM = 10
+DEFAULT_ZOOM = 9  # Slightly zoomed out to show more of the region
 
+# Bounds derived from actual GTFS stop locations (3119 stops)
+# Run ui/get_boundaries.py to recalculate if needed
 BOUNDS = {
-    "min_lat": 57.8,
-    "max_lat": 58.9,
-    "min_lon": 14.5,
-    "max_lon": 16.8
+    "min_lat": 56.6414,
+    "max_lat": 58.8654,
+    "min_lon": 14.6144,
+    "max_lon": 16.9578,
 }
 
-# Color scheme for occupancy levels
+# Color scheme for occupancy levels (for point predictions)
 OCCUPANCY_COLORS = {
     0: "#22c55e",  # Empty - green
     1: "#22c55e",  # Many seats - green
@@ -51,8 +53,25 @@ OCCUPANCY_COLORS = {
     6: "#6b7280",  # Not accepting - gray
 }
 
-static_trip_df = load_static_trip_info()
-static_trip_and_stops_df = load_static_stops_info()
+# Lazy-load static data (deferred to avoid blocking app startup)
+@st.cache_resource
+def get_static_trip_df():
+    """Load static trip info from Hopsworks (cached)."""
+    try:
+        return load_static_trip_info()
+    except Exception as e:
+        print(f"Warning: Could not load static trip info: {e}")
+        return None
+
+@st.cache_resource
+def get_static_stops_df():
+    """Load static stops info from Hopsworks (cached)."""
+    try:
+        return load_static_stops_info()
+    except Exception as e:
+        print(f"Warning: Could not load static stops info: {e}")
+        return None
+
 
 @st.cache_resource
 def get_model():
@@ -63,36 +82,45 @@ def get_model():
         st.error(f"Failed to load model: {e}")
         return None
 
+
 @st.cache_data
 def cached_predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
     return predict_occupancy(lat, lon, hour, day_of_week, weather, holidays)
 
-@st.cache_data
-def load_precomputed_heatmaps():
-    with open("ui/precomputed_heatmaps.pkl", "rb") as f:
-        return pickle.load(f)
 
-precomputed_heatmaps = load_precomputed_heatmaps()
+def load_precomputed_contours():
+    """Load precomputed contour GeoJSON from file (not cached to pick up new files)."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    contours_path = os.path.join(script_dir, "precomputed_contours.json")
 
-def generate_heatmap_data(hour, day_of_week, weather, holidays):
-    """Generate heat map data by predicting crowding across a grid."""
+    if os.path.exists(contours_path):
+        try:
+            contours = load_contours_from_file(contours_path)
+            print(f"Loaded {len(contours)} precomputed time slots from {contours_path}")
+            return contours
+        except Exception as e:
+            print(f"Error loading contours: {e}")
+            return {}
+    print(f"Contours file not found: {contours_path}")
+    return {}
+
+
+def generate_contours_on_demand(hour, day_of_week, weather, holidays):
+    """
+    Generate contour GeoJSON on-demand if precomputed data is not available.
+    This is slower but provides a fallback.
+    """
     model = get_model()
     if model is None:
-        return []
+        return None
 
-    # Create grid of points across Östergötland
-    # lat_steps = 15
-    # lon_steps = 20
-    lat_steps = 10
-    lon_steps = 15
+    # Grid for on-demand generation (smaller for speed)
+    lat_steps = 15
+    lon_steps = 20
     lats = np.linspace(BOUNDS["min_lat"], BOUNDS["max_lat"], lat_steps)
     lons = np.linspace(BOUNDS["min_lon"], BOUNDS["max_lon"], lon_steps)
 
-    heatmap_data = []
-    total_points = len(lats) * len(lons)
-    progress_bar = st.progress(0)
-    counter = 0
-
+    prediction_data = []
     for lat in lats:
         for lon in lons:
             try:
@@ -100,50 +128,118 @@ def generate_heatmap_data(hour, day_of_week, weather, holidays):
                     lat=lat, lon=lon, hour=hour, day_of_week=day_of_week,
                     weather=weather, holidays=holidays
                 )
-                # Weight by occupancy level (higher = more crowded = more intense)
-                intensity = pred_class / 5.0  # Normalize to 0-1
-                if intensity > 0.1:  # Only show if there's some crowding
-                    heatmap_data.append([lat, lon, intensity])
+                intensity = pred_class / 6.0  # Normalize to 0-1
+                prediction_data.append([lat, lon, intensity])
             except Exception:
-                pass
-            
-            counter += 1
-            progress_bar.progress(counter / total_points)
+                prediction_data.append([lat, lon, 0.0])
 
-    progress_bar.empty()
-    return heatmap_data
+    # Convert to GeoJSON contours
+    return grid_to_contour_geojson(prediction_data, BOUNDS)
 
-def get_top_crowded_points(n=5, hour=None, day_of_week=None, weather=None, holidays=None):
-    """Return top N crowded points with associated trip/stop info."""
-    heatmap_data = precomputed_heatmaps.get((hour, day_of_week), [])
 
-    if not heatmap_data:
-        # Fallback: small grid prediction
-        heatmap_data = generate_heatmap_data(hour, day_of_week, weather, holidays)
+def get_test_contour_geojson():
+    """
+    Return a simple hardcoded test GeoJSON to verify rendering works.
+    Creates concentric rectangles with different colors.
+    """
+    # Create simple test polygons - concentric rectangles around Linköping
+    center_lat = 58.41
+    center_lon = 15.62
 
-    # Sort by intensity descending
-    top_points = sorted(heatmap_data, key=lambda x: x[2], reverse=True)[:n]
+    features = []
 
-    top_info = []
-    for lat, lon, intensity in top_points:
-        trip_info = find_nearest_trip(lat, lon, selected_datetime, static_trip_df)
-        closest_stop = None
-        if trip_info:
-            trip_id = trip_info.get("trip_id")
-            closest_stop = find_closest_stop(lat, lon, trip_id, static_trip_and_stops_df)
-        top_info.append({
-            "lat": lat,
-            "lon": lon,
-            "intensity": intensity,
-            "trip_info": trip_info,
-            "closest_stop": closest_stop
-        })
-    return top_info
+    # Outer ring (green - empty)
+    features.append({
+        "type": "Feature",
+        "properties": {
+            "color": "#22c55e",
+            "fillOpacity": 0.35,
+            "level_idx": 0,
+        },
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [center_lon - 0.8, center_lat - 0.5],
+                [center_lon + 0.8, center_lat - 0.5],
+                [center_lon + 0.8, center_lat + 0.5],
+                [center_lon - 0.8, center_lat + 0.5],
+                [center_lon - 0.8, center_lat - 0.5],
+            ]]
+        }
+    })
+
+    # Middle ring (yellow - few seats)
+    features.append({
+        "type": "Feature",
+        "properties": {
+            "color": "#eab308",
+            "fillOpacity": 0.35,
+            "level_idx": 2,
+        },
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [center_lon - 0.4, center_lat - 0.25],
+                [center_lon + 0.4, center_lat - 0.25],
+                [center_lon + 0.4, center_lat + 0.25],
+                [center_lon - 0.4, center_lat + 0.25],
+                [center_lon - 0.4, center_lat - 0.25],
+            ]]
+        }
+    })
+
+    # Inner ring (red - crowded)
+    features.append({
+        "type": "Feature",
+        "properties": {
+            "color": "#ef4444",
+            "fillOpacity": 0.35,
+            "level_idx": 4,
+        },
+        "geometry": {
+            "type": "Polygon",
+            "coordinates": [[
+                [center_lon - 0.15, center_lat - 0.1],
+                [center_lon + 0.15, center_lat - 0.1],
+                [center_lon + 0.15, center_lat + 0.1],
+                [center_lon - 0.15, center_lat + 0.1],
+                [center_lon - 0.15, center_lat - 0.1],
+            ]]
+        }
+    })
+
+    return {
+        "type": "FeatureCollection",
+        "features": features
+    }
+
+
+def get_contour_geojson(hour, day_of_week, weather=None, holidays=None):
+    """
+    Get contour GeoJSON for the given hour and day of week.
+    Uses precomputed data if available, otherwise returns test contours.
+    """
+    # Key format: tuple (hour, day_of_week) - load_contours_from_file converts string keys to tuples
+    key = (hour, day_of_week)
+
+    # Load precomputed contours (fresh load to pick up changes)
+    precomputed = load_precomputed_contours()
+
+    # Try precomputed first
+    if key in precomputed:
+        geojson = precomputed[key]
+        n_features = len(geojson.get("features", []))
+        print(f"Found precomputed contours for {key}: {n_features} features")
+        return geojson
+
+    # For now, return test contours to verify rendering works
+    print(f"No precomputed contours for {key}, using test contours")
+    return get_test_contour_geojson()
 
 
 def create_map(selected_lat=None, selected_lon=None, show_heatmap=False,
-               heatmap_data=None):
-    """Create a Folium map with optional marker and heatmap."""
+               contour_geojson=None):
+    """Create a Folium map with optional marker and contour overlay."""
     center_lat = selected_lat if selected_lat else DEFAULT_LAT
     center_lon = selected_lon if selected_lon else DEFAULT_LON
 
@@ -153,30 +249,37 @@ def create_map(selected_lat=None, selected_lon=None, show_heatmap=False,
         tiles="CartoDB positron"
     )
 
-    # Add coverage area rectangle
+    # Add contour overlay if enabled
+    if show_heatmap and contour_geojson and contour_geojson.get("features"):
+        # Add each contour level as a separate GeoJSON layer
+        folium.GeoJson(
+            contour_geojson,
+            style_function=lambda feature: {
+                'fillColor': feature['properties']['color'],
+                'fillOpacity': feature['properties'].get('fillOpacity', 0.35),
+                'color': 'none',  # No border
+                'weight': 0
+            },
+            name="Crowding Forecast"
+        ).add_to(m)
+
+    # Add coverage area rectangle (subtle border)
     folium.Rectangle(
         bounds=[[BOUNDS["min_lat"], BOUNDS["min_lon"]],
                 [BOUNDS["max_lat"], BOUNDS["max_lon"]]],
-        color="#3388ff",
+        color="#6b7280",
         fill=False,
-        weight=2,
-        opacity=0.5,
+        weight=1,
+        opacity=0.3,
+        dash_array="5, 5",
     ).add_to(m)
-
-    # Add heatmap if enabled
-    if show_heatmap and heatmap_data and len(heatmap_data) > 0:
-        HeatMap(
-            data=heatmap_data,
-            min_opacity=0.3,
-            radius=25,
-            blur=15,
-        ).add_to(m)
 
     # Add marker if location selected
     if selected_lat and selected_lon:
         folium.Marker(
             [selected_lat, selected_lon],
             tooltip=f"Selected: {selected_lat:.4f}, {selected_lon:.4f}",
+            icon=folium.Icon(color="blue", icon="info-sign")
         ).add_to(m)
 
     return m
@@ -203,8 +306,11 @@ def make_prediction(lat, lon, selected_datetime):
             weather=weather,
             holidays=holidays
         )
-        
-        trip_info = find_nearest_trip(lat, lon, selected_datetime, static_trip_df)
+
+        trip_info = None
+        static_trip_df = get_static_trip_df()
+        if static_trip_df is not None:
+            trip_info = find_nearest_trip(lat, lon, selected_datetime, static_trip_df)
 
         return pred_class, confidence, {
             "weather": weather,
@@ -224,12 +330,12 @@ if "selected_lon" not in st.session_state:
 
 # Header
 st.title("HappySardines")
-st.markdown("*How packed are buses in Östergötland?*")
+st.markdown("*Predicted bus crowding in Östergötland*")
 
 # Check if model is available
 model = get_model()
 if model is None:
-    st.error("⚠️ Could not load prediction model. Please check the configuration.")
+    st.error("Could not load prediction model. Please check the configuration.")
     st.stop()
 
 # Sidebar controls
@@ -251,18 +357,17 @@ with st.sidebar:
 
     # View mode
     st.subheader("View Mode")
-    show_heatmap = st.toggle("Show Crowding Forecast", value=False,
+    show_heatmap = st.toggle("Show Crowding Forecast", value=True,
                               help="Display predicted crowding across the region")
 
     if show_heatmap:
-        st.info("🔥 Heat map shows predicted crowding levels. Red = busy, Green = quiet.")
-
-        with st.spinner("Generating predictions across region..."):
-            weather = get_weather_for_prediction(DEFAULT_LAT, DEFAULT_LON, selected_datetime)
-            holidays = get_holiday_features(selected_datetime)
-            st.session_state.heatmap_data = generate_heatmap_data(
-                hour, selected_date.weekday(), weather, holidays
-            )
+        st.markdown("""
+        **Legend:**
+        - 🟢 Green: Empty / Many seats
+        - 🟡 Yellow: Few seats available
+        - 🟠 Orange: Standing room only
+        - 🔴 Red: Crowded
+        """)
 
     st.divider()
 
@@ -273,14 +378,13 @@ with st.sidebar:
 
         This tool predicts bus crowding levels based on:
         - 📍 Location
-        - 🚌 Bus vehicle data
         - 🕐 Time of day
         - 📅 Day of week
         - 🌡️ Weather conditions
         - 🇸🇪 Holidays
 
         **Data sources:**
-        - Bus occupancy data from Östgötatrafiken (Koda API)
+        - Bus occupancy data from Östgötatrafiken (KODA API)
         - Weather from Open-Meteo
         - Holidays from Svenska Dagar API
 
@@ -291,39 +395,34 @@ with st.sidebar:
 col1, col2 = st.columns([2, 1])
 
 with col1:
-    st.subheader("📍 Click on the map to select a location")
+    st.subheader("Click on the map to select a location")
 
-    # Get heatmap data if available
-    # heatmap_data = st.session_state.get("heatmap_data", [])
-    heatmap_data = precomputed_heatmaps.get((hour, selected_date.weekday()), []) if show_heatmap else []
+    # Get weather/holidays for on-demand generation fallback
+    weather = get_weather_for_prediction(DEFAULT_LAT, DEFAULT_LON, selected_datetime)
+    holidays = get_holiday_features(selected_datetime)
+
+    # Get contour GeoJSON for current hour/day
+    contour_geojson = None
+    if show_heatmap:
+        contour_geojson = get_contour_geojson(
+            hour, selected_date.weekday(),
+            weather=weather, holidays=holidays
+        )
 
     # Create and display map
     m = create_map(
         selected_lat=st.session_state.selected_lat,
         selected_lon=st.session_state.selected_lon,
         show_heatmap=show_heatmap,
-        heatmap_data=heatmap_data
+        contour_geojson=contour_geojson
     )
-    
-    weather = get_weather_for_prediction(DEFAULT_LAT, DEFAULT_LON, selected_datetime)
-    holidays = get_holiday_features(selected_datetime)
-    
-    # top_crowded = get_top_crowded_points(n=3)
 
-    # # Add markers on the map
-    # for point in top_crowded:
-    #     folium.Marker(
-    #         [point["lat"], point["lon"]],
-    #         tooltip=f"Crowding: {int(point['intensity']*100)}%",
-    #         icon=folium.Icon(color="red", icon="bus", prefix="fa")
-    #     ).add_to(m)
-
-    # Render the map
+    # Render the map - key includes hour and day to force re-render on time change
     map_data = st_folium(
         m,
         height=500,
         use_container_width=True,
-        key="map"
+        key=f"map_{hour}_{selected_date.weekday()}"
     )
 
     # Handle map clicks
@@ -333,22 +432,6 @@ with col1:
         st.session_state.selected_lon = clicked["lng"]
         st.rerun()
 
-    # Display list below map
-    # for idx, point in enumerate(top_crowded, 1):
-    #     trip_info = point["trip_info"]
-    #     closest_stop = point["closest_stop"]
-    #     intensity_pct = int(point["intensity"] * 100)
-    #     st.markdown(f"**{idx}. Location:** {point['lat']:.4f}, {point['lon']:.4f} (Crowding: {intensity_pct}%)")
-    #     if trip_info:
-    #         route = trip_info.get("route_short_name") or trip_info.get("route_long_name", "Unknown route")
-    #         st.markdown(f"- Route: {route}")
-    #         if trip_info.get("route_desc"):
-    #             st.markdown(f"- Bus type: {trip_info['route_desc']}")
-    #         if trip_info.get("trip_id"):
-    #             st.markdown(f"- Trip ID: {trip_info['trip_id']}")
-    #     if closest_stop:
-    #         st.markdown(f"- Closest stop: {closest_stop}")
-
 with col2:
     st.subheader("Prediction")
 
@@ -356,7 +439,7 @@ with col2:
     st.markdown(f"**Location:** {st.session_state.selected_lat:.4f}, {st.session_state.selected_lon:.4f}")
 
     # Make prediction
-    with st.spinner("Fetching occupancy prediction..."):
+    with st.spinner("Fetching prediction..."):
         pred_class, confidence, result = make_prediction(
             st.session_state.selected_lat,
             st.session_state.selected_lon,
@@ -383,7 +466,7 @@ with col2:
                 {label_info['message']}
             </div>
             <div style="margin-top: 12px; font-size: 0.9em; opacity: 0.8;">
-                Prediction confidence: {confidence:.0%}
+                Confidence: {confidence:.0%}
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -394,10 +477,10 @@ with col2:
             holidays = result["holidays"]
             trip_info = result.get("trip_info")
 
-            day_type = "📅🇸🇪 Holiday" if holidays.get("is_red_day") else (
-                "📅🇸🇪 Work-free day" if holidays.get("is_work_free") else "📅 Regular day"
+            day_type = "Holiday" if holidays.get("is_red_day") else (
+                "Work-free day" if holidays.get("is_work_free") else "Regular day"
             )
-            
+
             if trip_info:
                 info_lines = []
 
@@ -406,48 +489,48 @@ with col2:
                 route_long_name = trip_info.get("route_long_name")
                 if route_number and route_long_name:
                     info_lines.append(f"{route_number} - {route_long_name}")
-                    
                 elif route_number:
                     info_lines.append(f"Route: {route_number}")
-                    
                 elif route_long_name:
                     info_lines.append(f"Route: {route_long_name}")
 
                 # Bus type / description
                 route_desc = trip_info.get("route_desc")
                 if route_desc:
-                    info_lines.append(f"Bus type: {route_desc}")
+                    info_lines.append(f"Type: {route_desc}")
 
-                # Trip ID (always show)
+                # Trip ID
                 trip_id = trip_info.get("trip_id")
                 if trip_id is not None:
-                    info_lines.append(f"Trip ID: {trip_id}")
-                    
                     # Closest stop
+                    static_stops_df = get_static_stops_df()
                     closest_stop = find_closest_stop(
                         st.session_state.selected_lat,
                         st.session_state.selected_lon,
                         trip_id,
-                        static_trip_and_stops_df  # assume this is loaded once globally
+                        static_stops_df
                     )
                     if closest_stop:
-                        info_lines.append(f"Closest stop: {closest_stop}")
+                        info_lines.append(f"Nearest stop: {closest_stop}")
 
-                # Display
-                st.markdown("**Bus Info:**\n- " + "\n- ".join(info_lines))
+                if info_lines:
+                    st.markdown("**Bus Info:**\n- " + "\n- ".join(info_lines))
 
-            conditions_lines = []
-            conditions_lines.append(f"Temperature: {weather.get('temperature_2m', '?'):.0f}°C")
-            conditions_lines.append(f"Weekday: {day_type}")
-            conditions_lines.append(f"{selected_datetime.strftime('%A')}")
-            
-            if weather.get('snowfall') != 0:
-                conditions_lines.append("Risk of snow")
-                
-            if weather.get('rain') != 0:
-                conditions_lines.append("Risk of rain")
-                
-            st.markdown("**Conditions:**\n- " + "\n- ".join(conditions_lines))
+            # Weather conditions
+            conditions = []
+            temp = weather.get('temperature_2m')
+            if temp is not None:
+                conditions.append(f"{temp:.0f}°C")
+
+            if weather.get('snowfall', 0) > 0:
+                conditions.append("Snow")
+            if weather.get('rain', 0) > 0:
+                conditions.append("Rain")
+
+            conditions.append(day_type)
+            conditions.append(selected_datetime.strftime('%A'))
+
+            st.markdown("**Conditions:** " + " | ".join(conditions))
 
     elif isinstance(result, str):
         st.error(result)
