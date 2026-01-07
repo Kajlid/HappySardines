@@ -8,7 +8,7 @@ bus crowding in Östergötland.
 import streamlit as st
 import pickle
 
-# Page config - MUST be first Streamlit command
+# Page config
 st.set_page_config(
     page_title="HappySardines",
     page_icon="🐟",
@@ -126,11 +126,16 @@ def get_top_crowded_points(n=5, hour=None, day_of_week=None, weather=None, holid
 
     top_info = []
     for lat, lon, intensity in top_points:
-        trip_info = find_nearest_trip(lat, lon, selected_datetime, static_trip_df)
+        trip_info = find_nearest_trip(
+            lat,
+            lon,
+            selected_datetime,
+            static_trip_and_stops_df
+        )
         closest_stop = None
         if trip_info:
             trip_id = trip_info.get("trip_id")
-            closest_stop = find_closest_stop(lat, lon, trip_id, static_trip_and_stops_df)
+            # closest_stop = find_closest_stop(lat, lon, trip_id, static_trip_and_stops_df)
         top_info.append({
             "lat": lat,
             "lon": lon,
@@ -204,7 +209,12 @@ def make_prediction(lat, lon, selected_datetime):
             holidays=holidays
         )
         
-        trip_info = find_nearest_trip(lat, lon, selected_datetime, static_trip_df)
+        trip_info = find_nearest_trip(
+            lat,
+            lon,
+            selected_datetime,
+            static_trip_and_stops_df
+        )
 
         return pred_class, confidence, {
             "weather": weather,
@@ -333,21 +343,6 @@ with col1:
         st.session_state.selected_lon = clicked["lng"]
         st.rerun()
 
-    # Display list below map
-    # for idx, point in enumerate(top_crowded, 1):
-    #     trip_info = point["trip_info"]
-    #     closest_stop = point["closest_stop"]
-    #     intensity_pct = int(point["intensity"] * 100)
-    #     st.markdown(f"**{idx}. Location:** {point['lat']:.4f}, {point['lon']:.4f} (Crowding: {intensity_pct}%)")
-    #     if trip_info:
-    #         route = trip_info.get("route_short_name") or trip_info.get("route_long_name", "Unknown route")
-    #         st.markdown(f"- Route: {route}")
-    #         if trip_info.get("route_desc"):
-    #             st.markdown(f"- Bus type: {trip_info['route_desc']}")
-    #         if trip_info.get("trip_id"):
-    #             st.markdown(f"- Trip ID: {trip_info['trip_id']}")
-    #     if closest_stop:
-    #         st.markdown(f"- Closest stop: {closest_stop}")
 
 with col2:
     st.subheader("Prediction")
@@ -423,15 +418,16 @@ with col2:
                 if trip_id is not None:
                     info_lines.append(f"Trip ID: {trip_id}")
                     
-                    # Closest stop
-                    closest_stop = find_closest_stop(
-                        st.session_state.selected_lat,
-                        st.session_state.selected_lon,
-                        trip_id,
-                        static_trip_and_stops_df  # assume this is loaded once globally
-                    )
+                    closest_stop = trip_info.get("closest_stop")
+                    trip_direction = trip_info.get("closest_stop_headsign")  
                     if closest_stop:
                         info_lines.append(f"Closest stop: {closest_stop}")
+                    if trip_direction:
+                        info_lines.append(f"Bus/tram direction: {trip_direction}")
+                        
+                    distance_m = trip_info.get("distance_m")
+                    if distance_m is not None:
+                        info_lines.append(f"Distance from click: {distance_m} m")
 
                 # Display
                 st.markdown("**Bus Info:**\n- " + "\n- ".join(info_lines))
