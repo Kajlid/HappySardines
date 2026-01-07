@@ -42,8 +42,6 @@ load_dotenv()
 MODEL_NAME = "occupancy_xgboost_model_new"
 FEATURE_VIEW_NAME = "occupancy_fv"
 FEATURE_VIEW_VERSION = 1
-test_start_string = os.getenv("TEST_START_DATE")
-test_start_date = pd.to_datetime(test_start_string).date()
 
 # XGBoost hyperparameters
 # Using softprob to get probabilities for threshold tuning
