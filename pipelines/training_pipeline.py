@@ -262,9 +262,12 @@ def fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg):
     return joined_df
 
 
-def prepare_data(df, feature_view, test_start_date=None):
+def prepare_data(df, test_start_date=None, test_ratio=0.2):
     """
     Prepare training and test data with time-based split.
+
+    Uses the manually fetched DataFrame directly (not Feature View) to ensure
+    all data is used for training.
 
     Args:
         df: Joined DataFrame with features and target
@@ -274,50 +277,69 @@ def prepare_data(df, feature_view, test_start_date=None):
     Returns:
         X_train, X_test, y_train, y_test
     """
+    from sklearn.model_selection import train_test_split
+
     print("Preparing train/test split...")
 
     # Drop rows with missing target
     df = df.dropna(subset=[TARGET])
     print(f"  Rows with valid target: {len(df)}")
 
-    # Feature columns
-    # feature_cols = VEHICLE_FEATURES + WEATHER_FEATURES + HOLIDAY_FEATURES
+    # Sort by window_start for temporal split
+    df = df.sort_values('window_start')
 
-    # Temporal train test split
+    # Define feature columns (exclude target and non-feature columns)
+    exclude_cols = [TARGET, 'window_start', 'date', 'speed_std', 'avg_speed']
+    feature_cols = [c for c in df.columns if c not in exclude_cols]
+
+    print(f"  Feature columns: {feature_cols}")
+
+    # Temporal train/test split
     if test_start_date:
         # Use date-based split
-        X_train, X_test, y_train, y_test = feature_view.train_test_split(
-            test_start=test_start_date
-        )
+        test_date = pd.to_datetime(test_start_date).date()
+        df['_date'] = pd.to_datetime(df['window_start']).dt.date
+        train_mask = df['_date'] < test_date
+        test_mask = df['_date'] >= test_date
+
+        train_df = df[train_mask]
+        test_df = df[test_mask]
+        df = df.drop(columns=['_date'])
+        train_df = train_df.drop(columns=['_date'])
+        test_df = test_df.drop(columns=['_date'])
     else:
-        # Use ratio-based split (80/20)
-        X_train, X_test, y_train, y_test = feature_view.train_test_split(
-            test_size=0.2
-        )
+        # Use ratio-based split (preserve temporal order)
+        split_idx = int(len(df) * (1 - test_ratio))
+        train_df = df.iloc[:split_idx]
+        test_df = df.iloc[split_idx:]
 
-    print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
-    
-    print(X_train.columns)
-    print(X_test.columns)
+    print(f"Train samples: {len(train_df)}, Test samples: {len(test_df)}")
 
-    # Fill missing values
-    X_train = X_train.fillna(X_train.median())
-    X_test = X_test.fillna(X_train.median())  # Use train median for test
+    # Separate features and target
+    X_train = train_df[feature_cols].copy()
+    X_test = test_df[feature_cols].copy()
+    y_train = train_df[TARGET].copy()
+    y_test = test_df[TARGET].copy()
+
+    print(f"  Features: {X_train.columns.tolist()}")
+
+    # Fill missing values (only for numeric columns)
+    numeric_cols = X_train.select_dtypes(include=[np.number]).columns
+    train_medians = X_train[numeric_cols].median()
+    X_train[numeric_cols] = X_train[numeric_cols].fillna(train_medians)
+    X_test[numeric_cols] = X_test[numeric_cols].fillna(train_medians)
 
     # Convert boolean columns to int
     for col in HOLIDAY_FEATURES:
         if col in X_train.columns:
             X_train[col] = X_train[col].astype(int)
             X_test[col] = X_test[col].astype(int)
-            
-    X_train['trip_id'] = X_train['trip_id'].astype(int)
-    X_train['vehicle_id'] = X_train['vehicle_id'].astype(int)
-    X_test['trip_id'] = X_test['trip_id'].astype(int)
-    X_test['vehicle_id'] = X_test['vehicle_id'].astype(int)
-    
-    # Dropping features that had less than 0.02 in feature importance in a test run
-    X_features = X_train.drop(columns=['speed_std', 'avg_speed'])            
-    X_test_features = X_test.drop(columns=['speed_std', 'avg_speed']) 
+
+    # Convert ID columns to int
+    for col in ['trip_id', 'vehicle_id']:
+        if col in X_train.columns:
+            X_train[col] = X_train[col].astype(int)
+            X_test[col] = X_test[col].astype(int)
 
     # Class distribution
     print(f"\n  Class distribution (train):")
@@ -326,7 +348,7 @@ def prepare_data(df, feature_view, test_start_date=None):
         pct = count / len(y_train) * 100
         print(f"    Class {cls}: {count} ({pct:.1f}%)")
 
-    return X_features, X_test_features, y_train, y_test
+    return X_train, X_test, y_train, y_test
 
 
 MAX_WEIGHT = 50.0
@@ -519,7 +541,7 @@ def run_training_pipeline(test_start_date=None, upload_model=True):
     print("\nFetching and joining training data...")
     df = fetch_training_data_manual(vehicle_fg, weather_fg, holiday_fg)
     feature_view = create_feature_view(fs, vehicle_fg, weather_fg, holiday_fg)
-    X_train, X_test, y_train, y_test = prepare_data(df, feature_view, test_start_date)
+    X_train, X_test, y_train, y_test = prepare_data(df, test_start_date)
 
     # Train model
     model = train_model(X_train, y_train)
