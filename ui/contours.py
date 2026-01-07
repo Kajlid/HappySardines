@@ -19,13 +19,14 @@ from shapely.validation import make_valid
 import json
 
 
-# Color scheme: green (empty) -> yellow -> orange -> red (crowded)
+# Color scheme: green -> yellow -> orange -> red for maximum contrast
+# Maps to occupancy classes via intensity values in precompute_heatmaps.py
 CONTOUR_COLORS = [
-    "#22c55e",  # 0.0-0.2: Green (empty/many seats)
-    "#84cc16",  # 0.2-0.4: Light green
-    "#eab308",  # 0.4-0.6: Yellow (few seats)
-    "#f97316",  # 0.6-0.8: Orange (standing)
-    "#ef4444",  # 0.8-1.0: Red (crowded)
+    "#22c55e",  # 0.0-0.2: Green (class 0 - empty)
+    "#eab308",  # 0.2-0.4: Yellow (class 1 - many seats)
+    "#f97316",  # 0.4-0.6: Orange (class 2 - few seats)
+    "#ef4444",  # 0.6-0.8: Red (class 3 - standing)
+    "#7f1d1d",  # 0.8-1.0: Dark red (class 4+ - crowded)
 ]
 
 # Contour levels (intensity thresholds)

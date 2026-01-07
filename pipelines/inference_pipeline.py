@@ -41,33 +41,44 @@ GRID_CONFIG = {
     "lon_steps": 20,
 }
 
-# Feature order - must match training pipeline exactly (occupancy_xgboost_model_new)
+# Feature order - must match training pipeline exactly (occupancy_xgboost_model_new v4)
+# Model v4 was trained on full vehicle_trip_agg_fg features including lat/lon bounds and bearing
 FEATURE_ORDER = [
     "trip_id",
     "vehicle_id",
     "max_speed",
     "n_positions",
+    "lat_min",
+    "lat_max",
     "lat_mean",
+    "lon_min",
+    "lon_max",
     "lon_mean",
+    "bearing_min",
+    "bearing_max",
     "hour",
     "day_of_week",
     "temperature_2m",
     "precipitation",
     "cloud_cover",
     "wind_speed_10m",
-    "snowfall",
     "rain",
+    "snowfall",
     "is_work_free",
     "is_red_day",
     "is_day_before_holiday",
 ]
 
 # Default vehicle features (approximate averages from training data)
+# For inference without real trip data, we set lat/lon bounds equal to the point
+# and use neutral bearing values
 DEFAULT_VEHICLE_FEATURES = {
     "trip_id": 0,          # placeholder
     "vehicle_id": 0,       # placeholder
     "max_speed": 45.0,
     "n_positions": 30,
+    "bearing_min": 0.0,    # neutral bearing
+    "bearing_max": 360.0,  # full range (stationary/unknown direction)
 }
 
 
@@ -192,10 +203,16 @@ def generate_batch_predictions(
     # Build feature matrix for batch prediction
     features_list = []
     for point in grid_points:
+        lat, lon = point["lat"], point["lon"]
         features = {
             **DEFAULT_VEHICLE_FEATURES,
-            "lat_mean": point["lat"],
-            "lon_mean": point["lon"],
+            # For grid predictions, lat/lon bounds equal the point (no trip movement)
+            "lat_min": lat,
+            "lat_max": lat,
+            "lat_mean": lat,
+            "lon_min": lon,
+            "lon_max": lon,
+            "lon_mean": lon,
             "hour": hour,
             "day_of_week": day_of_week,
             **weather,

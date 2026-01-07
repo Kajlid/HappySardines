@@ -14,7 +14,8 @@ from holidays import get_holiday_features
 from contours import grid_to_contour_geojson, save_contours_to_file
 
 # Use mock predictor for testing visualization with varied colors
-USE_MOCK_PREDICTOR = True
+# Set to False to use the real model (occupancy_xgboost_model_new v4)
+USE_MOCK_PREDICTOR = False
 
 
 def predict_occupancy_mock(lat, lon, hour, day_of_week, weather, holidays):
@@ -61,8 +62,9 @@ def predict_occupancy_mock(lat, lon, hour, day_of_week, weather, holidays):
 BOUNDS = {"min_lat": 56.6414, "max_lat": 58.8654, "min_lon": 14.6144, "max_lon": 16.9578}
 
 # Grid resolution for predictions (higher = more detailed contours, slower)
-LAT_STEPS = 20
-LON_STEPS = 25
+# 40x50 = 2000 points gives ~6km x 3km resolution, good balance of detail vs speed
+LAT_STEPS = 40
+LON_STEPS = 50
 
 # Hours of interest
 HOURS = list(range(5, 24))  # 5:00-23:00
@@ -113,8 +115,14 @@ def main():
                         pred_class, confidence, _ = predictor_func(
                             lat, lon, hour, weekday, weather, holidays
                         )
-                        # Normalize 0-6 -> 0-1
-                        intensity = pred_class / 6.0
+                        # Map occupancy class to intensity to match contour color levels:
+                        # Class 0 (empty) -> 0.1 (green, 0.0-0.2)
+                        # Class 1 (many seats) -> 0.3 (yellow, 0.2-0.4)
+                        # Class 2 (few seats) -> 0.5 (orange, 0.4-0.6)
+                        # Class 3 (standing) -> 0.7 (red, 0.6-0.8)
+                        # Class 4+ (crowded) -> 0.9 (dark red, 0.8-1.0)
+                        intensity_map = {0: 0.1, 1: 0.3, 2: 0.5, 3: 0.7, 4: 0.9, 5: 0.9, 6: 0.9}
+                        intensity = intensity_map.get(pred_class, 0.1)
                         prediction_data.append([lat, lon, intensity])
                     except Exception:
                         # Default to 0 (empty) on error

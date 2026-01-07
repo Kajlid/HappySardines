@@ -61,23 +61,29 @@ OCCUPANCY_LABELS = {
     }
 }
 
-# Feature order expected by the model
-# Must match training pipeline exactly
+# Feature order expected by the model (occupancy_xgboost_model_new v4)
+# Must match training pipeline exactly - includes lat/lon bounds and bearing
 FEATURE_ORDER = [
     "trip_id",
     "vehicle_id",
     "max_speed",
     "n_positions",
+    "lat_min",
+    "lat_max",
     "lat_mean",
+    "lon_min",
+    "lon_max",
     "lon_mean",
+    "bearing_min",
+    "bearing_max",
     "hour",
     "day_of_week",
     "temperature_2m",
     "precipitation",
     "cloud_cover",
     "wind_speed_10m",
-    "snowfall", 
-    "rain",  
+    "rain",
+    "snowfall",
     "is_work_free",
     "is_red_day",
     "is_day_before_holiday",
@@ -88,6 +94,8 @@ FEATURE_ORDER = [
 DEFAULT_VEHICLE_FEATURES = {
     "max_speed": 45.0,      # typical max speed
     "n_positions": 30,      # typical GPS points per trip window
+    "bearing_min": 0.0,     # neutral bearing
+    "bearing_max": 360.0,   # full range (stationary/unknown direction)
 }
 
 
@@ -117,7 +125,8 @@ def load_model():
         mr = project.get_model_registry()
 
         print("Fetching model from registry...")
-        model_entry = mr.get_model("occupancy_xgboost_model_new", version=None)  # Latest version
+        # Get version 4 explicitly (the model trained with 23 features)
+        model_entry = mr.get_model("occupancy_xgboost_model_new", version=4)
 
         print(f"Downloading model version {model_entry.version}...")
         model_dir = model_entry.download()
@@ -162,9 +171,17 @@ def predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
         "max_speed": DEFAULT_VEHICLE_FEATURES["max_speed"],
         "n_positions": DEFAULT_VEHICLE_FEATURES["n_positions"],
 
-        # Location
+        # Location bounds (set equal to point for single-location prediction)
+        "lat_min": lat,
+        "lat_max": lat,
         "lat_mean": lat,
+        "lon_min": lon,
+        "lon_max": lon,
         "lon_mean": lon,
+
+        # Bearing (neutral values for point prediction)
+        "bearing_min": DEFAULT_VEHICLE_FEATURES["bearing_min"],
+        "bearing_max": DEFAULT_VEHICLE_FEATURES["bearing_max"],
 
         # Time
         "hour": hour,
@@ -175,8 +192,8 @@ def predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
         "precipitation": weather.get("precipitation", 0.0),
         "cloud_cover": weather.get("cloud_cover", 50.0),
         "wind_speed_10m": weather.get("wind_speed_10m", 5.0),
-        "snowfall": weather.get("snowfall", 0.0), 
-        "rain": weather.get("rain", 0.0),             
+        "rain": weather.get("rain", 0.0),
+        "snowfall": weather.get("snowfall", 0.0),
 
         # Holidays (convert bool to int)
         "is_work_free": int(holidays.get("is_work_free", False)),

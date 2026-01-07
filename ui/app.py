@@ -219,14 +219,11 @@ def get_contour_geojson(hour, day_of_week, weather=None, holidays=None):
     Get contour GeoJSON for the given hour and day of week.
     Uses precomputed data if available, otherwise returns test contours.
     """
+    # Key format: tuple (hour, day_of_week) - load_contours_from_file converts string keys to tuples
     key = (hour, day_of_week)
 
     # Load precomputed contours (fresh load to pick up changes)
     precomputed = load_precomputed_contours()
-
-    # Debug logging
-    print(f"Looking for contours with key {key}")
-    print(f"Available keys: {list(precomputed.keys())}")
 
     # Try precomputed first
     if key in precomputed:
@@ -420,12 +417,12 @@ with col1:
         contour_geojson=contour_geojson
     )
 
-    # Render the map
+    # Render the map - key includes hour and day to force re-render on time change
     map_data = st_folium(
         m,
         height=500,
         use_container_width=True,
-        key="map"
+        key=f"map_{hour}_{selected_date.weekday()}"
     )
 
     # Handle map clicks
