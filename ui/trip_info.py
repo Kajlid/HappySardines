@@ -31,7 +31,7 @@ def find_nearest_trip(lat, lon, datetime_obj, static_trip_df):
     """
     # For static data, we can only match by service_id/date/time if available
     # Here we just pick a random trip as placeholder
-    if len(static_trip_df) == 0:
+    if static_trip_df is None or len(static_trip_df) == 0:
         return None
     
     trip = static_trip_df.sample(1).iloc[0]  # pick 1 random trip for demo
@@ -47,6 +47,8 @@ def find_closest_stop(lat, lon, trip_id, stops_df):
     """
     Returns the closest stop to a given lat/lon for the specified trip_id.
     """
+    if stops_df is None:
+        return None
     # Filter stops for this trip
     trip_stops = stops_df[stops_df["trip_id"] == trip_id]
     if trip_stops.empty:
