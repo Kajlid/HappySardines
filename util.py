@@ -5,6 +5,9 @@ import pandas as pd
 from haversine import haversine, Unit
 from datetime import datetime, timedelta
 import great_expectations as ge
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+    
 
 MAX_RETRIES = 3
 WAIT_SECONDS = 5  # wait between retries
@@ -340,3 +343,45 @@ def _empty_holiday_features() -> dict:
         "is_holiday": False,
         "holiday_name": None,
     }
+
+def plot_bus_occupancy_forecast(df: pd.DataFrame, file_path: str | None = None, title="Hourly Occupancy Forecast", show_hindcast=False):
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    x = df["window_start"]
+    y = df["avg_label"]
+
+    ax.plot(
+        x,
+        y,
+        linewidth=2,
+        marker="o"
+    )
+
+    ax.set_xlabel("Time")
+    ax.set_ylabel("Occupancy level (0-6)")
+    ax.set_title(title)
+
+    # occupancy bands (approximate meanings)
+    ranges = [
+        (0, 1, "Empty"),
+        (1, 2, "Many seats"),
+        (2, 3, "Few seats"),
+        (3, 4, "Standing"),
+        (4, 5, "Crowded"),
+        (5, 6, "Not accepting")
+    ]
+
+    colors = ["#d1fae5", "#a7f3d0", "#fde68a", "#fdba74", "#fecaca", "#e5e7eb"]
+
+    for (start, end, _label), color in zip(ranges, colors):
+        ax.axhspan(start, end, color=color, alpha=0.35)
+
+    ax.set_ylim(0, 6)
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    if file_path:
+        plt.savefig(file_path)
+    
+    return plt
+
