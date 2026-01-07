@@ -30,12 +30,13 @@ from util import fetch_weather_forecast, get_holiday_features_for_date
 
 load_dotenv()
 
-# Grid configuration for Östergötland region
+# Grid configuration - bounds derived from actual GTFS stop locations (3119 stops)
+# Run ui/get_boundaries.py to recalculate if needed
 GRID_CONFIG = {
-    "min_lat": 57.8,
-    "max_lat": 58.9,
-    "min_lon": 14.5,
-    "max_lon": 16.8,
+    "min_lat": 56.6414,
+    "max_lat": 58.8654,
+    "min_lon": 14.6144,
+    "max_lon": 16.9578,
     "lat_steps": 15,
     "lon_steps": 20,
 }
