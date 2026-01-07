@@ -284,9 +284,16 @@ def prepare_data(df, feature_view, test_start_date=None):
     # feature_cols = VEHICLE_FEATURES + WEATHER_FEATURES + HOLIDAY_FEATURES
 
     # Temporal train test split
-    X_train, X_test, y_train, y_test = feature_view.train_test_split(
-        test_start=test_start_date
-    )
+    if test_start_date:
+        # Use date-based split
+        X_train, X_test, y_train, y_test = feature_view.train_test_split(
+            test_start=test_start_date
+        )
+    else:
+        # Use ratio-based split (80/20)
+        X_train, X_test, y_train, y_test = feature_view.train_test_split(
+            test_size=0.2
+        )
 
     print(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
     
