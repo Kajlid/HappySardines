@@ -27,7 +27,9 @@ import hopsworks
 from predictor import predict_occupancy, load_model, OCCUPANCY_LABELS
 from weather import get_weather_for_prediction
 from holidays import get_holiday_features
-from trip_info import load_static_trip_info, find_nearest_trip, load_static_stops_info, find_closest_stop
+from trip_info import (
+    load_static_trip_info, find_nearest_trip, load_static_stops_info
+)
 from contours import load_contours_from_file, grid_to_cells_geojson
 
 # Constants
@@ -75,6 +77,12 @@ def get_static_stops_df():
         return None
 
 
+def is_stops_data_cached():
+    """Check if stops data is already in cache without triggering load."""
+    # Check if the cache has been populated by looking at session state
+    return "stops_data_loaded" in st.session_state and st.session_state.stops_data_loaded
+
+
 @st.cache_resource
 def get_model():
     """Load model once and cache it."""
@@ -88,6 +96,33 @@ def get_model():
 @st.cache_data
 def cached_predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
     return predict_occupancy(lat, lon, hour, day_of_week, weather, holidays)
+
+
+@st.cache_data(ttl=3600)
+def fetch_trip_forecasts_from_hopsworks():
+    """
+    Fetch trip forecasts from Hopsworks forecast_fg.
+
+    Returns DataFrame with columns: trip_id, hour, weekday, predicted_occupancy, confidence
+    Returns None if forecast_fg doesn't exist or is empty.
+    """
+    try:
+        project = hopsworks.login()
+        fs = project.get_feature_store()
+        # Try v2 (new schema with hour/weekday), fall back to v1
+        for version in [2, 1]:
+            try:
+                forecast_fg = fs.get_feature_group("forecast_fg", version=version)
+                df = forecast_fg.read()
+                if df is not None and not df.empty:
+                    print(f"Loaded {len(df)} trip forecasts from Hopsworks v{version}")
+                    return df
+            except Exception:
+                continue
+        return None
+    except Exception as e:
+        print(f"Could not load trip forecasts: {e}")
+        return None
 
 
 @st.cache_resource
@@ -292,8 +327,12 @@ def create_map(selected_lat=None, selected_lon=None, show_heatmap=False,
     return m
 
 
-def make_prediction(lat, lon, selected_datetime):
-    """Make prediction and return formatted result."""
+def make_prediction(lat, lon, selected_datetime, skip_trip_info=False):
+    """Make prediction and return formatted result.
+
+    Args:
+        skip_trip_info: If True, skip the slow trip info lookup
+    """
     if lat is None or lon is None:
         return None, None, None
 
@@ -314,16 +353,44 @@ def make_prediction(lat, lon, selected_datetime):
             holidays=holidays
         )
 
+        # Find nearest trip from static data (only if not skipping)
         trip_info = None
-        static_trip_df = get_static_trip_df()
-        if static_trip_df is not None:
-            trip_info = find_nearest_trip(lat, lon, selected_datetime, static_trip_df)
+        trip_forecast = None
+
+        if not skip_trip_info:
+            static_stops_df = get_static_stops_df()
+            # Mark that we've loaded the data (for future quick checks)
+            st.session_state.stops_data_loaded = True
+
+            if static_stops_df is not None:
+                trip_info = find_nearest_trip(lat, lon, selected_datetime, static_stops_df)
+
+            # Try to get trip forecast if available
+            if trip_info and trip_info.get("trip_id"):
+                forecasts_df = fetch_trip_forecasts_from_hopsworks()
+                if forecasts_df is not None:
+                    trip_id = trip_info["trip_id"]
+                    hour = selected_datetime.hour
+                    weekday = selected_datetime.weekday()
+                    # Find matching forecast
+                    match = forecasts_df[
+                        (forecasts_df["trip_id"] == trip_id) &
+                        (forecasts_df["hour"] == hour) &
+                        (forecasts_df["weekday"] == weekday)
+                    ]
+                    if not match.empty:
+                        row = match.iloc[0]
+                        trip_forecast = {
+                            "predicted_occupancy": int(row.get("predicted_occupancy", 0)),
+                            "confidence": float(row.get("confidence", 0)),
+                        }
 
         return pred_class, confidence, {
             "weather": weather,
             "holidays": holidays,
             "datetime": selected_datetime,
-            "trip_info": trip_info
+            "trip_info": trip_info,
+            "trip_forecast": trip_forecast
         }
     except Exception as e:
         return None, None, str(e)
@@ -446,12 +513,16 @@ with col2:
     # Show selected coordinates
     st.markdown(f"**Location:** {st.session_state.selected_lat:.4f}, {st.session_state.selected_lon:.4f}")
 
-    # Make prediction
+    # Check if stops data is already cached (fast check)
+    stops_already_loaded = st.session_state.get("stops_data_loaded", False)
+
+    # Make prediction (skip trip info on first load to be fast)
     with st.spinner("Fetching prediction..."):
         pred_class, confidence, result = make_prediction(
             st.session_state.selected_lat,
             st.session_state.selected_lon,
-            selected_datetime
+            selected_datetime,
+            skip_trip_info=not stops_already_loaded
         )
 
     if pred_class is not None:
@@ -507,22 +578,51 @@ with col2:
                 if route_desc:
                     info_lines.append(f"Type: {route_desc}")
 
-                # Trip ID
-                trip_id = trip_info.get("trip_id")
-                if trip_id is not None:
-                    # Closest stop
-                    static_stops_df = get_static_stops_df()
-                    closest_stop = find_closest_stop(
-                        st.session_state.selected_lat,
-                        st.session_state.selected_lon,
-                        trip_id,
-                        static_stops_df
-                    )
-                    if closest_stop:
-                        info_lines.append(f"Nearest stop: {closest_stop}")
+                # Closest stop from trip info (already computed)
+                closest_stop = trip_info.get("closest_stop")
+                if closest_stop:
+                    info_lines.append(f"Nearest stop: {closest_stop}")
+
+                # Distance to stop
+                distance = trip_info.get("distance_m")
+                if distance is not None:
+                    info_lines.append(f"Distance: {distance}m")
 
                 if info_lines:
                     st.markdown("**Bus Info:**\n- " + "\n- ".join(info_lines))
+            elif not stops_already_loaded:
+                # Offer to load trip info (it's slow on first load)
+                if st.button("Load nearby bus info", help="First load takes ~1-2 minutes"):
+                    with st.spinner("Loading trip data from Hopsworks (this may take a minute)..."):
+                        # Trigger the load and rerun
+                        get_static_stops_df()
+                        st.session_state.stops_data_loaded = True
+                        st.rerun()
+
+            # Show trip-specific forecast if available
+            trip_forecast = result.get("trip_forecast")
+            if trip_forecast:
+                forecast_class = trip_forecast["predicted_occupancy"]
+                forecast_conf = trip_forecast["confidence"]
+                forecast_label = OCCUPANCY_LABELS.get(forecast_class, OCCUPANCY_LABELS[0])
+                forecast_color = OCCUPANCY_COLORS.get(forecast_class, "#6b7280")
+
+                st.markdown(f"""
+                <div style="
+                    background: {forecast_color}11;
+                    border: 1px solid {forecast_color}44;
+                    border-radius: 8px;
+                    padding: 12px;
+                    margin: 8px 0;
+                ">
+                    <div style="font-size: 0.85em; color: #6b7280; margin-bottom: 4px;">
+                        Trip-specific forecast:
+                    </div>
+                    <div style="font-weight: 600; color: {forecast_color};">
+                        {forecast_label['icon']} {forecast_label['label']} ({forecast_conf:.0%})
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
             # Weather conditions
             conditions = []

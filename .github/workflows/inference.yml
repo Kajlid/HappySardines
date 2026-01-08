@@ -1,17 +1,18 @@
-name: features-daily
+name: inference-daily
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # runs daily at 06:00 UTC
-  workflow_dispatch:      # allows manual runs
+    - cron: '0 9 * * *'   # Run daily at 09:00 UTC (after heatmap at 05:00)
+  workflow_dispatch:      # manual trigger
 
 defaults:
   run:
     working-directory: .
 
 jobs:
-  update-features:
+  run-inference:
     runs-on: ubuntu-latest
+    timeout-minutes: 120  # Trip forecasts may take longer than heatmaps
 
     steps:
       - name: Checkout repository
@@ -28,14 +29,12 @@ jobs:
             python -m pip install --upgrade pip
             pip install -r requirements.txt
 
-      - name: Run daily feature pipeline
+      - name: Run trip-based inference pipeline
         env:
           TZ: UTC
+          PYTHONUNBUFFERED: "1"
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
-          KODA_API_KEY: ${{ secrets.KODA_API_KEY }}
-          TRAFIKVERKET_API_KEY: ${{ secrets.TRAFIKVERKET_API_KEY }}
-          out_dir: ./data
-        
         run: |
-            python pipelines/daily-feature-pipeline.py
+            cd pipelines
+            python -u inference_pipeline.py
