@@ -46,9 +46,16 @@ jobs:
           PYTHONUNBUFFERED: "1"
           HOPSWORKS_API_KEY: ${{ secrets.HOPSWORKS_API_KEY }}
           HOPSWORKS_PROJECT: ${{ secrets.HOPSWORKS_PROJECT }}
-          TEST_START_DATE: ${{ inputs.test_start_date }}
-          UPLOAD_MODEL: ${{ inputs.upload_model }}
 
         run: |
             cd pipelines
-            jupyter nbconvert --to notebook --execute training_pipeline.ipynb
+            # Build command with optional arguments
+            CMD="python training_pipeline.py"
+            if [ -n "${{ inputs.test_start_date }}" ]; then
+              CMD="$CMD --test-start-date ${{ inputs.test_start_date }}"
+            fi
+            if [ "${{ inputs.upload_model }}" = "false" ]; then
+              CMD="$CMD --no-upload"
+            fi
+            echo "Running: $CMD"
+            $CMD
