@@ -90,12 +90,13 @@ def cached_predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
     return predict_occupancy(lat, lon, hour, day_of_week, weather, holidays)
 
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour
+@st.cache_resource
 def fetch_heatmaps_from_hopsworks():
     """
     Fetch all precomputed heatmaps from Hopsworks Feature Store.
 
     Tries v3 (high-res 40x50) first, falls back to v2 (low-res 20x25).
+    Uses cache_resource to persist across reruns - only fetches once per session.
 
     Returns dict mapping (hour, weekday) -> GeoJSON FeatureCollection
     """
@@ -222,9 +223,9 @@ def get_contour_geojson(hour, day_of_week, weather=None, holidays=None):
     """
     key = (hour, day_of_week)
 
-    # Try Hopsworks first
+    # Try Hopsworks first (cached by @st.cache_resource - only fetches once)
     hopsworks_heatmaps = fetch_heatmaps_from_hopsworks()
-    if key in hopsworks_heatmaps:
+    if hopsworks_heatmaps and key in hopsworks_heatmaps:
         geojson = hopsworks_heatmaps[key]
         n_features = len(geojson.get("features", []))
         print(f"Found heatmap in Hopsworks for {key}: {n_features} features")
@@ -334,6 +335,7 @@ if "selected_lat" not in st.session_state:
 if "selected_lon" not in st.session_state:
     st.session_state.selected_lon = DEFAULT_LON
 
+
 # Header
 st.title("HappySardines")
 st.markdown("*Predicted bus crowding in Östergötland*")
@@ -363,7 +365,7 @@ with st.sidebar:
 
     # View mode
     st.subheader("View Mode")
-    show_heatmap = st.toggle("Show Crowding Forecast", value=True,
+    show_heatmap = st.toggle("Show Crowding Forecast", value=False,
                               help="Display predicted crowding across the region")
 
     if show_heatmap:
@@ -406,17 +408,12 @@ col1, col2 = st.columns([2, 1])
 with col1:
     st.subheader("Click on the map to select a location")
 
-    # Get weather/holidays for on-demand generation fallback
-    weather = get_weather_for_prediction(DEFAULT_LAT, DEFAULT_LON, selected_datetime)
-    holidays = get_holiday_features(selected_datetime)
-
-    # Get contour GeoJSON for current hour/day
+    # Only fetch heatmap data when toggle is ON
     contour_geojson = None
     if show_heatmap:
-        contour_geojson = get_contour_geojson(
-            hour, selected_date.weekday(),
-            weather=weather, holidays=holidays
-        )
+        # fetch_heatmaps_from_hopsworks() is cached - only slow on first call
+        # weather/holidays not needed - already baked into precomputed heatmaps
+        contour_geojson = get_contour_geojson(hour, selected_date.weekday())
 
     # Create and display map
     m = create_map(
@@ -426,12 +423,14 @@ with col1:
         contour_geojson=contour_geojson
     )
 
-    # Render the map - key includes hour and day to force re-render on time change
+    # Render the map
+    # Use returned_objects to only trigger rerun on clicks, not zoom/pan
     map_data = st_folium(
         m,
         height=500,
         use_container_width=True,
-        key=f"map_{hour}_{selected_date.weekday()}"
+        returned_objects=["last_clicked"],
+        key="main_map"
     )
 
     # Handle map clicks
