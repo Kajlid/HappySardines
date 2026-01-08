@@ -102,8 +102,8 @@ def fetch_heatmaps_from_hopsworks():
         project = hopsworks.login()
         fs = project.get_feature_store()
 
-        # Get the feature group
-        heatmap_fg = fs.get_feature_group("heatmap_geojson_fg", version=1)
+        # Get the feature group (version 2 - v1 had Kafka issues)
+        heatmap_fg = fs.get_feature_group("heatmap_geojson_fg", version=2)
 
         # Read all data
         df = heatmap_fg.read()

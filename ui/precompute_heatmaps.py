@@ -75,10 +75,10 @@ def upload_heatmaps_to_hopsworks(contours: dict, max_retries: int = 3):
     df = pd.DataFrame(records)
     print(f"Prepared {len(df)} rows for upload")
 
-    # Get or create the feature group
+    # Get or create the feature group (version 2 - v1 had Kafka issues)
     heatmap_fg = fs.get_or_create_feature_group(
         name="heatmap_geojson_fg",
-        version=1,
+        version=2,
         description="Pre-computed heatmap GeoJSON for UI visualization",
         primary_key=["hour", "weekday"],
         event_time="generated_at",
