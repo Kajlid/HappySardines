@@ -19,8 +19,19 @@ from shapely.validation import make_valid
 import json
 
 
-# Color scheme: green -> yellow -> orange -> red for maximum contrast
-# Maps to occupancy classes via intensity values in precompute_heatmaps.py
+# Color scheme: green -> lime -> yellow -> orange -> red
+# Each class gets a distinct color for clear differentiation
+CLASS_COLORS = {
+    0: "#22c55e",  # Empty - green
+    1: "#84cc16",  # Many seats - lime (green-yellow mix)
+    2: "#eab308",  # Few seats - yellow
+    3: "#f97316",  # Standing room - orange
+    4: "#ef4444",  # Crushed standing - red
+    5: "#ef4444",  # Full - red
+    6: "#6b7280",  # Not accepting - gray
+}
+
+# Legacy contour colors (for backwards compatibility)
 CONTOUR_COLORS = [
     "#22c55e",  # 0.0-0.2: Green (class 0 - empty)
     "#eab308",  # 0.2-0.4: Yellow (class 1 - many seats)
@@ -182,6 +193,69 @@ def _empty_feature_collection() -> dict:
     return {
         "type": "FeatureCollection",
         "features": []
+    }
+
+
+def grid_to_cells_geojson(
+    prediction_data: list,
+    lat_step: float,
+    lon_step: float,
+    fill_opacity: float = 0.35,
+) -> dict:
+    """
+    Convert prediction grid to GeoJSON rectangles - one cell per prediction point.
+
+    This is simpler and more accurate than contours:
+    - No interpolation artifacts
+    - Each cell shows the exact prediction for that area
+    - No fake background fill
+
+    Args:
+        prediction_data: List of [lat, lon, pred_class] where pred_class is 0-6
+        lat_step: Height of each cell in degrees
+        lon_step: Width of each cell in degrees
+        fill_opacity: Opacity for the fill color (0-1)
+
+    Returns:
+        GeoJSON FeatureCollection with colored rectangle features
+    """
+    if not prediction_data:
+        return _empty_feature_collection()
+
+    features = []
+    half_lat = lat_step / 2
+    half_lon = lon_step / 2
+
+    for lat, lon, pred_class in prediction_data:
+        pred_class = int(pred_class)
+        color = CLASS_COLORS.get(pred_class, CLASS_COLORS[0])
+
+        # Create rectangle centered on the prediction point
+        coords = [[
+            [lon - half_lon, lat - half_lat],  # SW
+            [lon + half_lon, lat - half_lat],  # SE
+            [lon + half_lon, lat + half_lat],  # NE
+            [lon - half_lon, lat + half_lat],  # NW
+            [lon - half_lon, lat - half_lat],  # SW (close polygon)
+        ]]
+
+        feature = {
+            "type": "Feature",
+            "properties": {
+                "color": color,
+                "fillOpacity": fill_opacity,
+                "pred_class": pred_class,
+            },
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": coords
+            }
+        }
+        features.append(feature)
+
+    return {
+        "type": "FeatureCollection",
+        "features": features
     }
 
 

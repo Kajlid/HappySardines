@@ -212,3 +212,65 @@ def predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
     confidence = float(probabilities[predicted_class])
 
     return predicted_class, confidence, probabilities.tolist()
+
+
+def predict_occupancy_batch(locations, hour, day_of_week, weather, holidays):
+    """
+    Predict occupancy for multiple locations in a single batch.
+
+    Much faster than calling predict_occupancy() in a loop.
+
+    Args:
+        locations: List of (lat, lon) tuples
+        hour: Hour of day (0-23)
+        day_of_week: Day of week (0=Monday, 6=Sunday)
+        weather: Dict with temperature_2m, precipitation, cloud_cover, wind_speed_10m
+        holidays: Dict with is_work_free, is_red_day, is_day_before_holiday
+
+    Returns:
+        List of (predicted_class, confidence) tuples
+    """
+    model = load_model()
+
+    # Build all feature rows at once
+    rows = []
+    for lat, lon in locations:
+        rows.append({
+            "trip_id": 0,
+            "vehicle_id": 0,
+            "max_speed": DEFAULT_VEHICLE_FEATURES["max_speed"],
+            "n_positions": DEFAULT_VEHICLE_FEATURES["n_positions"],
+            "lat_min": lat,
+            "lat_max": lat,
+            "lat_mean": lat,
+            "lon_min": lon,
+            "lon_max": lon,
+            "lon_mean": lon,
+            "bearing_min": DEFAULT_VEHICLE_FEATURES["bearing_min"],
+            "bearing_max": DEFAULT_VEHICLE_FEATURES["bearing_max"],
+            "hour": hour,
+            "day_of_week": day_of_week,
+            "temperature_2m": weather.get("temperature_2m", 10.0),
+            "precipitation": weather.get("precipitation", 0.0),
+            "cloud_cover": weather.get("cloud_cover", 50.0),
+            "wind_speed_10m": weather.get("wind_speed_10m", 5.0),
+            "rain": weather.get("rain", 0.0),
+            "snowfall": weather.get("snowfall", 0.0),
+            "is_work_free": int(holidays.get("is_work_free", False)),
+            "is_red_day": int(holidays.get("is_red_day", False)),
+            "is_day_before_holiday": int(holidays.get("is_day_before_holiday", False)),
+        })
+
+    # Single DataFrame, single predict call
+    X = pd.DataFrame(rows)[FEATURE_ORDER]
+    probabilities = model.predict_proba(X)
+
+    # Extract results
+    results = []
+    for i, (lat, lon) in enumerate(locations):
+        probs = probabilities[i]
+        predicted_class = int(np.argmax(probs))
+        confidence = float(probs[predicted_class])
+        results.append((predicted_class, confidence))
+
+    return results

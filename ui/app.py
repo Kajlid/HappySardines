@@ -21,12 +21,14 @@ from streamlit_folium import st_folium
 import numpy as np
 from datetime import datetime, timedelta
 
+import hopsworks
+
 # Import prediction and data fetching modules
 from predictor import predict_occupancy, load_model, OCCUPANCY_LABELS
 from weather import get_weather_for_prediction
 from holidays import get_holiday_features
 from trip_info import load_static_trip_info, find_nearest_trip, load_static_stops_info, find_closest_stop
-from contours import load_contours_from_file, grid_to_contour_geojson
+from contours import load_contours_from_file, grid_to_cells_geojson
 
 # Constants
 DEFAULT_LAT = 58.4108
@@ -42,10 +44,10 @@ BOUNDS = {
     "max_lon": 16.9578,
 }
 
-# Color scheme for occupancy levels (for point predictions)
+# Color scheme for occupancy levels (must match contours.py CLASS_COLORS)
 OCCUPANCY_COLORS = {
     0: "#22c55e",  # Empty - green
-    1: "#22c55e",  # Many seats - green
+    1: "#84cc16",  # Many seats - lime
     2: "#eab308",  # Few seats - yellow
     3: "#f97316",  # Standing - orange
     4: "#ef4444",  # Crushed - red
@@ -88,6 +90,43 @@ def cached_predict_occupancy(lat, lon, hour, day_of_week, weather, holidays):
     return predict_occupancy(lat, lon, hour, day_of_week, weather, holidays)
 
 
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def fetch_heatmaps_from_hopsworks():
+    """
+    Fetch all precomputed heatmaps from Hopsworks Feature Store.
+
+    Returns dict mapping (hour, weekday) -> GeoJSON FeatureCollection
+    """
+    try:
+        print("Fetching heatmaps from Hopsworks...")
+        project = hopsworks.login()
+        fs = project.get_feature_store()
+
+        # Get the feature group
+        heatmap_fg = fs.get_feature_group("heatmap_geojson_fg", version=1)
+
+        # Read all data
+        df = heatmap_fg.read()
+
+        if df is None or df.empty:
+            print("No heatmap data found in Hopsworks")
+            return {}
+
+        # Convert to dict with tuple keys
+        heatmaps = {}
+        for _, row in df.iterrows():
+            key = (int(row["hour"]), int(row["weekday"]))
+            geojson = json.loads(row["geojson"])
+            heatmaps[key] = geojson
+
+        print(f"Loaded {len(heatmaps)} heatmaps from Hopsworks")
+        return heatmaps
+
+    except Exception as e:
+        print(f"Error fetching heatmaps from Hopsworks: {e}")
+        return {}
+
+
 def load_precomputed_contours():
     """Load precomputed contour GeoJSON from file (not cached to pick up new files)."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -107,7 +146,7 @@ def load_precomputed_contours():
 
 def generate_contours_on_demand(hour, day_of_week, weather, holidays):
     """
-    Generate contour GeoJSON on-demand if precomputed data is not available.
+    Generate grid cell GeoJSON on-demand if precomputed data is not available.
     This is slower but provides a fallback.
     """
     model = get_model()
@@ -120,6 +159,9 @@ def generate_contours_on_demand(hour, day_of_week, weather, holidays):
     lats = np.linspace(BOUNDS["min_lat"], BOUNDS["max_lat"], lat_steps)
     lons = np.linspace(BOUNDS["min_lon"], BOUNDS["max_lon"], lon_steps)
 
+    lat_step = (BOUNDS["max_lat"] - BOUNDS["min_lat"]) / (lat_steps - 1)
+    lon_step = (BOUNDS["max_lon"] - BOUNDS["min_lon"]) / (lon_steps - 1)
+
     prediction_data = []
     for lat in lats:
         for lon in lons:
@@ -128,112 +170,69 @@ def generate_contours_on_demand(hour, day_of_week, weather, holidays):
                     lat=lat, lon=lon, hour=hour, day_of_week=day_of_week,
                     weather=weather, holidays=holidays
                 )
-                intensity = pred_class / 6.0  # Normalize to 0-1
-                prediction_data.append([lat, lon, intensity])
+                prediction_data.append([lat, lon, pred_class])
             except Exception:
-                prediction_data.append([lat, lon, 0.0])
+                prediction_data.append([lat, lon, 0])
 
-    # Convert to GeoJSON contours
-    return grid_to_contour_geojson(prediction_data, BOUNDS)
+    # Convert to GeoJSON grid cells
+    return grid_to_cells_geojson(prediction_data, lat_step, lon_step)
 
 
 def get_test_contour_geojson():
     """
     Return a simple hardcoded test GeoJSON to verify rendering works.
-    Creates concentric rectangles with different colors.
+    Creates a small grid of cells with different colors.
     """
-    # Create simple test polygons - concentric rectangles around Linköping
+    # Create a 3x3 grid of test cells around Linköping
     center_lat = 58.41
     center_lon = 15.62
+    cell_size = 0.15
 
-    features = []
+    # Test predictions: mix of classes
+    test_data = [
+        (center_lat - cell_size, center_lon - cell_size, 0),  # green
+        (center_lat - cell_size, center_lon, 0),              # green
+        (center_lat - cell_size, center_lon + cell_size, 1),  # green
+        (center_lat, center_lon - cell_size, 0),              # green
+        (center_lat, center_lon, 2),                          # yellow
+        (center_lat, center_lon + cell_size, 2),              # yellow
+        (center_lat + cell_size, center_lon - cell_size, 0),  # green
+        (center_lat + cell_size, center_lon, 3),              # orange
+        (center_lat + cell_size, center_lon + cell_size, 0),  # green
+    ]
 
-    # Outer ring (green - empty)
-    features.append({
-        "type": "Feature",
-        "properties": {
-            "color": "#22c55e",
-            "fillOpacity": 0.35,
-            "level_idx": 0,
-        },
-        "geometry": {
-            "type": "Polygon",
-            "coordinates": [[
-                [center_lon - 0.8, center_lat - 0.5],
-                [center_lon + 0.8, center_lat - 0.5],
-                [center_lon + 0.8, center_lat + 0.5],
-                [center_lon - 0.8, center_lat + 0.5],
-                [center_lon - 0.8, center_lat - 0.5],
-            ]]
-        }
-    })
-
-    # Middle ring (yellow - few seats)
-    features.append({
-        "type": "Feature",
-        "properties": {
-            "color": "#eab308",
-            "fillOpacity": 0.35,
-            "level_idx": 2,
-        },
-        "geometry": {
-            "type": "Polygon",
-            "coordinates": [[
-                [center_lon - 0.4, center_lat - 0.25],
-                [center_lon + 0.4, center_lat - 0.25],
-                [center_lon + 0.4, center_lat + 0.25],
-                [center_lon - 0.4, center_lat + 0.25],
-                [center_lon - 0.4, center_lat - 0.25],
-            ]]
-        }
-    })
-
-    # Inner ring (red - crowded)
-    features.append({
-        "type": "Feature",
-        "properties": {
-            "color": "#ef4444",
-            "fillOpacity": 0.35,
-            "level_idx": 4,
-        },
-        "geometry": {
-            "type": "Polygon",
-            "coordinates": [[
-                [center_lon - 0.15, center_lat - 0.1],
-                [center_lon + 0.15, center_lat - 0.1],
-                [center_lon + 0.15, center_lat + 0.1],
-                [center_lon - 0.15, center_lat + 0.1],
-                [center_lon - 0.15, center_lat - 0.1],
-            ]]
-        }
-    })
-
-    return {
-        "type": "FeatureCollection",
-        "features": features
-    }
+    return grid_to_cells_geojson(test_data, cell_size, cell_size)
 
 
 def get_contour_geojson(hour, day_of_week, weather=None, holidays=None):
     """
     Get contour GeoJSON for the given hour and day of week.
-    Uses precomputed data if available, otherwise returns test contours.
+
+    Tries sources in order:
+    1. Hopsworks Feature Store (primary)
+    2. Local JSON file (fallback)
+    3. Test contours (last resort)
     """
-    # Key format: tuple (hour, day_of_week) - load_contours_from_file converts string keys to tuples
     key = (hour, day_of_week)
 
-    # Load precomputed contours (fresh load to pick up changes)
-    precomputed = load_precomputed_contours()
+    # Try Hopsworks first
+    hopsworks_heatmaps = fetch_heatmaps_from_hopsworks()
+    if key in hopsworks_heatmaps:
+        geojson = hopsworks_heatmaps[key]
+        n_features = len(geojson.get("features", []))
+        print(f"Found heatmap in Hopsworks for {key}: {n_features} features")
+        return geojson
 
-    # Try precomputed first
+    # Fall back to local JSON file
+    precomputed = load_precomputed_contours()
     if key in precomputed:
         geojson = precomputed[key]
         n_features = len(geojson.get("features", []))
-        print(f"Found precomputed contours for {key}: {n_features} features")
+        print(f"Found heatmap in local file for {key}: {n_features} features")
         return geojson
 
-    # For now, return test contours to verify rendering works
-    print(f"No precomputed contours for {key}, using test contours")
+    # Last resort: test contours
+    print(f"No heatmap for {key}, using test contours")
     return get_test_contour_geojson()
 
 
@@ -363,11 +362,14 @@ with st.sidebar:
     if show_heatmap:
         st.markdown("""
         **Legend:**
-        - 🟢 Green: Empty / Many seats
-        - 🟡 Yellow: Few seats available
-        - 🟠 Orange: Standing room only
-        - 🔴 Red: Crowded
-        """)
+        <div style="display: flex; flex-direction: column; gap: 4px; font-size: 14px;">
+            <div><span style="display: inline-block; width: 16px; height: 16px; background: #22c55e; border-radius: 3px; vertical-align: middle;"></span> Empty</div>
+            <div><span style="display: inline-block; width: 16px; height: 16px; background: #84cc16; border-radius: 3px; vertical-align: middle;"></span> Many seats</div>
+            <div><span style="display: inline-block; width: 16px; height: 16px; background: #eab308; border-radius: 3px; vertical-align: middle;"></span> Few seats</div>
+            <div><span style="display: inline-block; width: 16px; height: 16px; background: #f97316; border-radius: 3px; vertical-align: middle;"></span> Standing room</div>
+            <div><span style="display: inline-block; width: 16px; height: 16px; background: #ef4444; border-radius: 3px; vertical-align: middle;"></span> Crowded</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.divider()
 

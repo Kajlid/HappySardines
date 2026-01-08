@@ -6,6 +6,7 @@ Uses Open-Meteo API to get weather forecasts.
 
 import requests
 from datetime import datetime
+import time
 
 # Open-Meteo API
 OPENMETEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
@@ -55,10 +56,25 @@ def get_weather_for_prediction(lat: float, lon: float, target_datetime: datetime
         if days_ahead <= 0:
             params["past_days"] = 1
 
-        response = requests.get(OPENMETEO_FORECAST_URL, params=params, timeout=30)
+        # Retry logic for transient failures
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(OPENMETEO_FORECAST_URL, params=params, timeout=30)
+                if response.status_code == 200:
+                    break
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return _default_weather()
+        else:
+            print(f"Weather API error after {max_retries} retries: {response.status_code}")
+            return _default_weather()
 
         if response.status_code != 200:
-            print(f"Weather API error: {response.status_code}")
             return _default_weather()
 
         data = response.json()

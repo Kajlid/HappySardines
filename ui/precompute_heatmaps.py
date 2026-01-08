@@ -1,103 +1,139 @@
 """
-Precompute heatmap contours for all hour/weekday combinations.
+Precompute heatmap grid cells for all hour/weekday combinations.
 
-This script generates GeoJSON contour polygons from occupancy predictions
-and saves them to a JSON file for fast rendering in the UI.
+This script generates GeoJSON grid cells from occupancy predictions
+and uploads them to Hopsworks Feature Store for UI consumption.
+
+Each grid cell is a rectangle colored by the model's prediction for that location.
+No interpolation - what you see is exactly what the model predicts.
 """
 
 import os
+import json
 import numpy as np
+import pandas as pd
 from datetime import datetime
-from predictor import predict_occupancy, load_model
+
+import hopsworks
+
+from predictor import predict_occupancy_batch, load_model
 from weather import get_weather_for_prediction
 from holidays import get_holiday_features
-from contours import grid_to_contour_geojson, save_contours_to_file
+from contours import grid_to_cells_geojson, save_contours_to_file, load_contours_from_file
 
-# Use mock predictor for testing visualization with varied colors
-# Set to False to use the real model (occupancy_xgboost_model_new v4)
-USE_MOCK_PREDICTOR = False
-
-
-def predict_occupancy_mock(lat, lon, hour, day_of_week, weather, holidays):
-    """
-    Mock prediction that produces varied predictions for testing visualization.
-    Returns class 0-3 based on time of day and location.
-    """
-    import random
-    random.seed(int(lat * 1000 + lon * 100 + hour))  # Deterministic based on inputs
-
-    # Base prediction on time of day
-    if 7 <= hour <= 9 or 16 <= hour <= 18:
-        # Rush hour
-        if holidays.get("is_work_free") or holidays.get("is_red_day"):
-            base_class = 1  # Holiday rush hour = many seats
-        else:
-            base_class = 2 if hour < 8 or hour > 17 else 3  # Peak = standing
-    elif 10 <= hour <= 15:
-        base_class = 1  # Midday = many seats
-    else:
-        base_class = 0  # Early/late = empty
-
-    # Add location-based variation (urban centers are busier)
-    # Linköping inner city: ~58.41, 15.62
-    dist_to_center = ((lat - 58.41)**2 + (lon - 15.62)**2)**0.5
-    if dist_to_center < 0.1:
-        base_class = min(base_class + 1, 3)  # More crowded in city center
-    elif dist_to_center > 0.5:
-        base_class = max(base_class - 1, 0)  # Less crowded far from center
-
-    # Add some random variation
-    variation = random.choice([-1, 0, 0, 0, 1])  # Mostly no change
-    predicted_class = max(0, min(6, base_class + variation))
-
-    # Mock probabilities
-    probabilities = [0.1] * 7
-    probabilities[predicted_class] = 0.6
-    confidence = 0.6
-
-    return predicted_class, confidence, probabilities
 
 # Map bounds derived from actual GTFS stop locations (3119 stops)
 # Run ui/get_boundaries.py to recalculate if needed
 BOUNDS = {"min_lat": 56.6414, "max_lat": 58.8654, "min_lon": 14.6144, "max_lon": 16.9578}
 
-# Grid resolution for predictions (higher = more detailed contours, slower)
-# 40x50 = 2000 points gives ~6km x 3km resolution, good balance of detail vs speed
-LAT_STEPS = 40
-LON_STEPS = 50
+# Grid resolution for predictions
+# 20x25 = 500 points - faster generation (~5 min), good for regional overview
+# Each cell is ~12km x 6km
+LAT_STEPS = 20
+LON_STEPS = 25
 
 # Hours of interest
 HOURS = list(range(5, 24))  # 5:00-23:00
-WEEKDAYS = list(range(7))    # 0=Monday ... 6=Sunday
 
-# Output files
+def get_weekdays_to_compute():
+    """Get weekdays for today and tomorrow."""
+    from datetime import timedelta
+    today = datetime.now().weekday()
+    tomorrow = (datetime.now() + timedelta(days=1)).weekday()
+    return [today, tomorrow]
+
+# Output files (for local fallback)
 OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONTOURS_FILE = os.path.join(OUTPUT_DIR, "precomputed_contours.json")
 
 
+def upload_heatmaps_to_hopsworks(contours: dict, max_retries: int = 3):
+    """
+    Upload heatmap GeoJSON data to Hopsworks Feature Store.
+
+    Each time slot (hour, weekday) gets stored as one row with the full
+    GeoJSON as a string. This allows fast retrieval by the UI.
+    """
+    import time
+
+    print("\nConnecting to Hopsworks for upload...")
+    project = hopsworks.login()
+    fs = project.get_feature_store()
+
+    # Build DataFrame with one row per time slot
+    records = []
+    generated_at = datetime.now()
+
+    for (hour, weekday), geojson in contours.items():
+        records.append({
+            "hour": int(hour),
+            "weekday": int(weekday),
+            "geojson": json.dumps(geojson),  # Store as JSON string
+            "generated_at": generated_at,
+        })
+
+    df = pd.DataFrame(records)
+    print(f"Prepared {len(df)} rows for upload")
+
+    # Get or create the feature group
+    heatmap_fg = fs.get_or_create_feature_group(
+        name="heatmap_geojson_fg",
+        version=1,
+        description="Pre-computed heatmap GeoJSON for UI visualization",
+        primary_key=["hour", "weekday"],
+        event_time="generated_at",
+        online_enabled=True,  # Enable online serving for fast reads
+    )
+
+    # Insert with retry logic
+    for attempt in range(max_retries):
+        try:
+            heatmap_fg.insert(df, write_options={"wait_for_job": True})
+            print(f"Uploaded {len(df)} heatmap time slots to Hopsworks")
+            return project
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt * 5  # 5s, 10s, 20s
+                print(f"Upload failed (attempt {attempt + 1}/{max_retries}): {e}")
+                print(f"Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                print(f"Upload failed after {max_retries} attempts: {e}")
+                print("Data saved locally - you can retry upload with --upload-only")
+                raise
+
+    return project
+
+
 def main():
-    if USE_MOCK_PREDICTOR:
-        print("Using MOCK predictor for visualization testing...")
-        predictor_func = predict_occupancy_mock
-    else:
-        print("Loading model...")
-        model = load_model()
-        predictor_func = predict_occupancy
+    import sys
+    print("Loading model...")
+    load_model()  # Pre-load model once
 
     lats = np.linspace(BOUNDS["min_lat"], BOUNDS["max_lat"], LAT_STEPS)
     lons = np.linspace(BOUNDS["min_lon"], BOUNDS["max_lon"], LON_STEPS)
 
+    # Pre-compute all grid locations once
+    all_locations = [(lat, lon) for lat in lats for lon in lons]
+
     # Contours dictionary: {(hour, weekday): GeoJSON FeatureCollection}
+    # Calculate cell size based on grid resolution
+    lat_step = (BOUNDS["max_lat"] - BOUNDS["min_lat"]) / (LAT_STEPS - 1)
+    lon_step = (BOUNDS["max_lon"] - BOUNDS["min_lon"]) / (LON_STEPS - 1)
+
     contours = {}
 
-    total = len(HOURS) * len(WEEKDAYS)
+    # Only compute for today and tomorrow
+    weekdays = get_weekdays_to_compute()
+    total = len(HOURS) * len(weekdays)
     count = 0
 
-    print(f"Precomputing contours for {total} time slots...")
-    print(f"Grid: {LAT_STEPS}x{LON_STEPS} = {LAT_STEPS * LON_STEPS} points per slot")
+    print(f"Precomputing grid cells for {total} time slots (today={weekdays[0]}, tomorrow={weekdays[1]})...")
+    print(f"Grid: {LAT_STEPS}x{LON_STEPS} = {LAT_STEPS * LON_STEPS} cells per slot")
+    print(f"Cell size: {lat_step:.4f}° lat x {lon_step:.4f}° lon (~{lat_step*111:.1f}km x {lon_step*111*0.55:.1f}km)")
 
     for hour in HOURS:
-        for weekday in WEEKDAYS:
+        for weekday in weekdays:
             count += 1
             dt = datetime.now().replace(hour=hour)
 
@@ -107,38 +143,63 @@ def main():
             weather = get_weather_for_prediction(center_lat, center_lon, dt)
             holidays = get_holiday_features(dt)
 
-            # Generate predictions across the grid
-            prediction_data = []
-            for lat in lats:
-                for lon in lons:
-                    try:
-                        pred_class, confidence, _ = predictor_func(
-                            lat, lon, hour, weekday, weather, holidays
-                        )
-                        # Map occupancy class to intensity to match contour color levels:
-                        # Class 0 (empty) -> 0.1 (green, 0.0-0.2)
-                        # Class 1 (many seats) -> 0.3 (yellow, 0.2-0.4)
-                        # Class 2 (few seats) -> 0.5 (orange, 0.4-0.6)
-                        # Class 3 (standing) -> 0.7 (red, 0.6-0.8)
-                        # Class 4+ (crowded) -> 0.9 (dark red, 0.8-1.0)
-                        intensity_map = {0: 0.1, 1: 0.3, 2: 0.5, 3: 0.7, 4: 0.9, 5: 0.9, 6: 0.9}
-                        intensity = intensity_map.get(pred_class, 0.1)
-                        prediction_data.append([lat, lon, intensity])
-                    except Exception:
-                        # Default to 0 (empty) on error
-                        prediction_data.append([lat, lon, 0.0])
+            # Batch prediction - MUCH faster than individual calls
+            try:
+                results = predict_occupancy_batch(
+                    all_locations, hour, weekday, weather, holidays
+                )
+            except Exception as e:
+                print(f"  Error in batch prediction: {e}")
+                results = [(0, 0.0)] * len(all_locations)
 
-            # Convert to contour GeoJSON
-            geojson = grid_to_contour_geojson(prediction_data, BOUNDS)
+            # Build prediction data and count classes
+            prediction_data = []
+            class_counts = {i: 0 for i in range(7)}
+            for (lat, lon), (pred_class, _) in zip(all_locations, results):
+                prediction_data.append([lat, lon, pred_class])
+                class_counts[pred_class] += 1
+
+            # Convert to grid cell GeoJSON (no interpolation)
+            geojson = grid_to_cells_geojson(prediction_data, lat_step, lon_step)
             contours[(hour, weekday)] = geojson
 
-            n_features = len(geojson.get("features", []))
-            print(f"[{count}/{total}] hour={hour:02d}, weekday={weekday}: {n_features} contour levels")
+            # Show class distribution
+            non_zero = {k: v for k, v in class_counts.items() if v > 0 and k != 0}
+            dist_str = ", ".join(f"c{k}:{v}" for k, v in sorted(non_zero.items()))
+            print(f"[{count}/{total}] hour={hour:02d}, weekday={weekday}: {len(prediction_data)} cells | {dist_str or 'all class 0'}")
 
-    # Save contours to file
+    # Save local copy FIRST (so we don't lose work if upload fails)
     save_contours_to_file(contours, CONTOURS_FILE)
-    print(f"\nDone! Contours saved to {CONTOURS_FILE}")
+    print(f"Local backup saved to {CONTOURS_FILE}")
+
+    # Upload to Hopsworks Feature Store (unless skipped)
+    if "--skip-upload" not in sys.argv:
+        try:
+            upload_heatmaps_to_hopsworks(contours)
+            print("\nDone! Heatmaps uploaded to Hopsworks Feature Store")
+        except Exception as e:
+            print(f"\nHopsworks upload failed: {e}")
+            print("Local JSON saved successfully - UI will use fallback")
+    else:
+        print("\nSkipping Hopsworks upload (--skip-upload flag)")
+        print("Local JSON saved successfully")
+
+
+def upload_only():
+    """Upload existing JSON file to Hopsworks without recomputing."""
+    print("Loading existing contours from JSON...")
+    contours = load_contours_from_file(CONTOURS_FILE)
+    if not contours:
+        print(f"No contours found in {CONTOURS_FILE}")
+        return
+    print(f"Loaded {len(contours)} time slots from JSON")
+    upload_heatmaps_to_hopsworks(contours)
+    print("\nDone! Existing heatmaps uploaded to Hopsworks")
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if "--upload-only" in sys.argv:
+        upload_only()
+    else:
+        main()

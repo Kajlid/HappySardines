@@ -2,7 +2,7 @@ name: heatmap-generation
 
 on:
   schedule:
-    - cron: '0 5 * * *'   # Run daily at 05:00 UTC (06:00 CET), before inference
+    - cron: '0 5 * * *'   # Run daily at 05:00 UTC (06:00 CET)
   workflow_dispatch:      # manual trigger
 
 defaults:
@@ -17,8 +17,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup python
         uses: actions/setup-python@v5
@@ -32,7 +30,7 @@ jobs:
             pip install -r requirements.txt
             pip install -r ui/requirements.txt
 
-      - name: Generate heatmap contours
+      - name: Generate and upload heatmaps to Hopsworks
         env:
           TZ: UTC
           PYTHONUNBUFFERED: "1"
@@ -41,13 +39,3 @@ jobs:
         run: |
             cd ui
             python -u precompute_heatmaps.py
-
-      - name: Commit updated contours
-        run: |
-            git config --local user.email "github-actions[bot]@users.noreply.github.com"
-            git config --local user.name "github-actions[bot]"
-            git add ui/precomputed_contours.json
-            git diff --staged --quiet || git commit -m "chore(heatmap): update precomputed contours
-
-            🤖 Generated with [Claude Code](https://claude.com/claude-code)"
-            git push
