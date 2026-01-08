@@ -95,6 +95,8 @@ def fetch_heatmaps_from_hopsworks():
     """
     Fetch all precomputed heatmaps from Hopsworks Feature Store.
 
+    Tries v3 (high-res 40x50) first, falls back to v2 (low-res 20x25).
+
     Returns dict mapping (hour, weekday) -> GeoJSON FeatureCollection
     """
     try:
@@ -102,25 +104,30 @@ def fetch_heatmaps_from_hopsworks():
         project = hopsworks.login()
         fs = project.get_feature_store()
 
-        # Get the feature group (version 2 - v1 had Kafka issues)
-        heatmap_fg = fs.get_feature_group("heatmap_geojson_fg", version=2)
+        # Try v3 first (high-res), fall back to v2 (low-res)
+        for version in [3, 2]:
+            try:
+                heatmap_fg = fs.get_feature_group("heatmap_geojson_fg", version=version)
+                df = heatmap_fg.read()
 
-        # Read all data
-        df = heatmap_fg.read()
+                if df is not None and not df.empty:
+                    # Convert to dict with tuple keys
+                    heatmaps = {}
+                    for _, row in df.iterrows():
+                        key = (int(row["hour"]), int(row["weekday"]))
+                        geojson = json.loads(row["geojson"])
+                        heatmaps[key] = geojson
 
-        if df is None or df.empty:
-            print("No heatmap data found in Hopsworks")
-            return {}
+                    print(f"Loaded {len(heatmaps)} heatmaps from Hopsworks v{version}")
+                    return heatmaps
+                else:
+                    print(f"No data in Hopsworks v{version}, trying fallback...")
+            except Exception as e:
+                print(f"Could not fetch v{version}: {e}")
+                continue
 
-        # Convert to dict with tuple keys
-        heatmaps = {}
-        for _, row in df.iterrows():
-            key = (int(row["hour"]), int(row["weekday"]))
-            geojson = json.loads(row["geojson"])
-            heatmaps[key] = geojson
-
-        print(f"Loaded {len(heatmaps)} heatmaps from Hopsworks")
-        return heatmaps
+        print("No heatmap data found in any Hopsworks version")
+        return {}
 
     except Exception as e:
         print(f"Error fetching heatmaps from Hopsworks: {e}")

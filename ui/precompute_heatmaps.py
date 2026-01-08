@@ -27,10 +27,11 @@ from contours import grid_to_cells_geojson, save_contours_to_file, load_contours
 BOUNDS = {"min_lat": 56.6414, "max_lat": 58.8654, "min_lon": 14.6144, "max_lon": 16.9578}
 
 # Grid resolution for predictions
-# 20x25 = 500 points - faster generation (~5 min), good for regional overview
-# Each cell is ~12km x 6km
-LAT_STEPS = 20
-LON_STEPS = 25
+# 40x50 = 2000 points - higher resolution for detailed heatmaps
+# Each cell is ~6km x 3km
+# Note: v2 has 20x25 (500 points) as fallback if v3 fails
+LAT_STEPS = 40
+LON_STEPS = 50
 
 # Hours of interest
 HOURS = list(range(5, 24))  # 5:00-23:00
@@ -75,11 +76,12 @@ def upload_heatmaps_to_hopsworks(contours: dict, max_retries: int = 3):
     df = pd.DataFrame(records)
     print(f"Prepared {len(df)} rows for upload")
 
-    # Get or create the feature group (version 2 - v1 had Kafka issues)
+    # Get or create the feature group (version 3 - high resolution 40x50)
+    # v2 (20x25 low-res) kept as fallback in UI
     heatmap_fg = fs.get_or_create_feature_group(
         name="heatmap_geojson_fg",
-        version=2,
-        description="Pre-computed heatmap GeoJSON for UI visualization",
+        version=3,
+        description="Pre-computed heatmap GeoJSON for UI visualization (high-res 40x50)",
         primary_key=["hour", "weekday"],
         event_time="generated_at",
         online_enabled=True,  # Enable online serving for fast reads
