@@ -2,8 +2,12 @@ name: inference-daily
 
 on:
   schedule:
-    - cron: '0 9 * * *'   # Run daily at 09:00 UTC (after heatmap at 05:00)
+    - cron: '0 9 * * *'   # Run daily at 09:00 UTC (fallback if feature pipeline didn't trigger)
   workflow_dispatch:      # manual trigger
+  workflow_run:
+    workflows: ["features-daily"]
+    types:
+      - completed
 
 defaults:
   run:
