@@ -1,13 +1,13 @@
 # HappySardines
 
-We have built a service for public transportation planners or the general public in Östergötlands län to get near hourly predictions of the congestion level of all buses and tramps in areas of Östergötlands län, using serverless machine learning and automated workflows.
+We have built a service for public transportation planners and the general public in Östergötlands län to get hourly predictions of the congestion level of all buses and trams in areas of Östergötlands län, using serverless machine learning and automated workflows.
 
 You can interact with the service here: [Link](link). OBS LÄGG TILL!!!!!
 
 
 ## Motivation
 
-Public transportation has an important role in society's green transition, how people move and interact, and in making communities less car dependent. However, crowded public transportations lead to increased spread of infections and dissatisfaction. Furthermore, city planners benefit from knowing which bus or tram trips that have a higher or lower utilization rate, which could act as an indicator for how to set timetables or where to make infrastructure efforts. This could also ensure that timetables are created with predicted occupancy in mind from the start, since changing timetables could be a costly venture.  
+Public transportation plays an important role in society's green transition, how people move and interact, and in making communities less car dependent. However, crowded public transportations lead to increased spread of infections and dissatisfaction. Furthermore, city planners benefit from knowing which bus or tram trips that have a higher or lower utilization rate, which could act as an indicator for how to set timetables or where to make infrastructure efforts. This could also ensure that timetables are created with predicted occupancy in mind from the start, since changing timetables could be a costly venture.  
 
 Since December 2022, The Trafiklab initiative has provided occupancy data for Östgötatrafiken's vehicles in their realtime GTFS (General Transit Feed Specification) Regional API. Since then, there has been BI initiatives to visualize and forecast congestion trends, but mostly at a Proof of Concept level. This project complements that initiative with a scalable machine learning based forecasting service that could act as an example application.
 
@@ -15,6 +15,26 @@ This project was built by Kajsa Lidin and Axel Barck-Holst as a final project wi
 
 
 ## Table of Contents
+
+- [HappySardines](#happysardines)
+  - [Motivation](#motivation)
+  - [Table of Contents](#table-of-contents)
+  - [Architecture](#architecture)
+  - [Dependencies and Setup](#dependencies-and-setup)
+  - [Data and Features](#data-and-features)
+    - [Koda API - bus and tram transportation and trip data](#koda-api---bus-and-tram-transportation-and-trip-data)
+    - [Trafikverket - nearby traffic situations](#trafikverket---nearby-traffic-situations)
+    - [Open-Meteo - Weather](#open-meteo---weather)
+    - [Svenska Dagar API - Holidays](#svenska-dagar-api---holidays)
+    - [Selected features and considerations](#selected-features-and-considerations)
+  - [Pipelines](#pipelines)
+    - [Feature Pipeline](#feature-pipeline)
+    - [Training Pipeline](#training-pipeline)
+    - [Inference Pipeline](#inference-pipeline)
+  - [Monitoring](#monitoring)
+  - [Contributing](#contributing)
+  - [Contact](#contact)
+
 
 ## Architecture
 
@@ -27,7 +47,7 @@ The machine learning model used for prediction in this project is XGBClassifer f
 
 ## Dependencies and Setup:
 
-All dependencies used for this project can be found in requirements.txt, and can be installed via a uv or conda environment.
+Dependencies used for this project can be found in requirements.txt, and can be installed via a uv or conda environment.
 
 In order to use the uv environment, run ```uv sync``` to update the environment with the correct dependencies. 
 
@@ -86,6 +106,9 @@ The real-time vehicle positions follow the [General Transit Feed Specification (
 5: Full
 6: Not accepting passengers
 ```
+However, it is important to note that the class distribution in the ingested dataset was highly imbalanced, with the majority of samples concentrated in the lowest occupancy classes (e.g., “Empty” and “Many seats available”). Moreover, labels 4–6 were entirely absent from the training data at the time of model development, but we made the decision not to remove them in case they will later appear in the ingested data. As a result of the class imbalance, despite applying class weighting to upweight underrepresented labels during training, the model remains biased toward predicting the majority classes and shows significantly higher confidence in its prediction of the these classes. 
+
+We decided to make the tradeoff to allow a slightly lower overall accuracy of the model in favor of not completely missing the underrepresanted classes.
 
 ### Trafikverket - nearby traffic situations
 
@@ -101,6 +124,8 @@ From the [Trafikverket Situation API](https://data.trafikverket.se/documentation
 - valid_until_further_notice (boolean flag)
 - deleted (boolean flag)
 - source
+
+These features were later joined with the Koda transportation data to find traffic events close to current bus locations, but these cross-source features were time-intensive to compute and did not contribute much to the prediction performance. For that reason, they have been excluded from the training features and inference at the moment.
 
 ### Open-Meteo - Weather
 
@@ -176,7 +201,7 @@ This pipeline trains an XGBClassifier (XGBoost) to predict occupancy status (occ
 The script:
 1. Selects features for training the data and create a Feature View.
 2. Splits the training data into train/test data sets based on a time-series split.
-3. Trains an XGBClassifer model to predict occupancy_mode.
+3. Trains an XGBClassifer model to predict occupancy_mode, with extra weight given to underrepresentated classes.
 4. Saves the trained model and performance metrics in a Hopsworks model registry.
 
 The performance of the model is monitored by the monitoring UI, which acts as an indicator of whether the model should be retrained (if performance is too bad).
