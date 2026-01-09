@@ -250,10 +250,10 @@ After training, XGBoost reports feature importance based on gain (how much each 
 ![Feature importance](./docs/feature_importance_example.png)
 
 The most important features are:
-1. **Calendar features** (`is_day_before_holiday`, `is_red_day`, `is_work_free`) - Holidays fundamentally change travel patterns
-2. **Location** (`lat_mean`, `lon_mean`) - Some areas and routes are consistently busier
+1. **Location** (`lat_mean`, `lon_mean`) - The top individual features; some areas and routes are consistently busier
+2. **Calendar features** (`is_day_before_holiday`, `is_red_day`, `is_work_free`) - Holidays fundamentally change travel patterns
 3. **Time** (`day_of_week`, `hour`) - Rush hours and weekday vs weekend patterns
-4. **Weather** - Temperature, wind, and precipitation affect transit usage
+4. **Weather** - Temperature, wind, snowfall, and precipitation affect transit usage
 
 ## Class Imbalance: The Main Challenge
 
