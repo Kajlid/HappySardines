@@ -228,12 +228,15 @@ def ingest_koda_rt_data(dates, fs):
         validate_with_expectations(daily_aggregated_df, agg_expectation_suite, name="Aggregated vehicle features")
 
         # Retry insert with backoff for transient Hopsworks errors
+        # NOTE: wait_for_job=True ensures materialization completes before pipeline exits.
+        # This is required because inference_pipeline.py triggers on workflow completion
+        # and needs the data to be queryable in the offline store for hindcast monitoring.
         insert_retries = 0
         while insert_retries < 3:
             try:
                 vehicle_trip_agg_fg.insert(
                     clean_column_names(daily_aggregated_df),
-                    write_options={"wait_for_job": False}
+                    write_options={"wait_for_job": True}
                 )
                 print(f"Ingested {len(daily_aggregated_df)} records to vehicle_trip_agg_fg")
                 break
