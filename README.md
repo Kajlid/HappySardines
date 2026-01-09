@@ -44,6 +44,8 @@ All workflow scrips (scheduled and manually run) can be found in ```.github/work
 
 The machine learning model used for prediction in this project is XGBClassifer from [XGBoost](https://xgboost.readthedocs.io/en/stable/).
 
+![Feature importance plot from XGBoost model](./docs/architecture.png)
+
 
 ## Dependencies and Setup:
 
