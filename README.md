@@ -64,7 +64,7 @@ flowchart TB
 
     subgraph Daily ["GitHub Actions - Daily"]
         direction TB
-        FEAT["daily-feature-pipeline.py<br/>10:00 UTC"]
+        FEAT["daily-feature-pipeline.py<br/>06:00 UTC"]
         INF["inference_pipeline.py<br/>after features"]
         HEAT["precompute_heatmaps.py<br/>05:00 UTC"]
     end
@@ -105,7 +105,6 @@ flowchart TB
     %% Daily pipeline flows
     FEAT --> FG_VEHICLE
     FEAT --> FG_WEATHER
-    FEAT --> FG_HOLIDAY
 
     %% Training flow
     FG_VEHICLE --> TRAIN
@@ -326,7 +325,7 @@ All pipelines are in `/pipelines` and run via GitHub Actions (`.github/workflows
 
 ### Feature Pipeline (`daily-feature-pipeline.py`)
 
-**Schedule**: Daily at 10:00 UTC
+**Schedule**: Daily at 06:00 UTC
 
 This pipeline fetches and processes the previous day's data:
 
