@@ -276,16 +276,24 @@ def generate_hindcast_monitoring(model, fs) -> pd.DataFrame:
 
     # Get yesterday's actual data from vehicle_trip_agg_fg
     yesterday = (datetime.now() - timedelta(days=1)).date()
+    yesterday_str = str(yesterday)
+    print(f"Looking for data from: {yesterday_str}")
 
     try:
         vehicle_fg = fs.get_feature_group("vehicle_trip_agg_fg", version=2)
         vehicle_df = vehicle_fg.read()
+        print(f"Read {len(vehicle_df)} total records from vehicle_trip_agg_fg")
+
+        # Debug: show available dates
         vehicle_df["window_start"] = pd.to_datetime(vehicle_df["window_start"])
         vehicle_df["_date"] = vehicle_df["window_start"].dt.date
+        unique_dates = sorted(vehicle_df["_date"].unique())
+        print(f"Available dates in data (last 5): {unique_dates[-5:] if len(unique_dates) > 5 else unique_dates}")
 
-        # Filter to yesterday
-        yesterday_df = vehicle_df[vehicle_df["_date"] == yesterday].copy()
-        print(f"Found {len(yesterday_df)} actual records from {yesterday}")
+        # Use string comparison to avoid type mismatch issues
+        vehicle_df["_date_str"] = vehicle_df["_date"].astype(str)
+        yesterday_df = vehicle_df[vehicle_df["_date_str"] == yesterday_str].copy()
+        print(f"Found {len(yesterday_df)} actual records from {yesterday_str}")
 
         if yesterday_df.empty:
             print("No actual data for yesterday, skipping hindcast")
@@ -293,6 +301,8 @@ def generate_hindcast_monitoring(model, fs) -> pd.DataFrame:
 
     except Exception as e:
         print(f"Error loading actual data: {e}")
+        import traceback
+        traceback.print_exc()
         return pd.DataFrame()
 
     # Get weather and holidays for yesterday
