@@ -2,7 +2,7 @@ name: features-daily
 
 on:
   schedule:
-    - cron: "0 6 * * *"   # runs daily at 06:00 UTC
+    - cron: "0 10 * * *"   # runs daily at 10:00 UTC (KODA API data may not be available earlier)
   workflow_dispatch:      # allows manual runs
 
 defaults:

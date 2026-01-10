@@ -193,10 +193,12 @@ def ingest_koda_rt_data(dates, fs):
     for date in dates:
         date_string = datetime.strftime(date, "%Y-%m-%d")
         dfs = []
+        empty_hours = 0
         for hour in range(24):
             print(f"Processing hour: {hour}")
             rows = fetch_koda_rt_data(date_string, hour)
             if not rows:
+                empty_hours += 1
                 continue
 
             print(f"Fetched {len(rows)} rows")
@@ -206,7 +208,13 @@ def ingest_koda_rt_data(dates, fs):
             dfs.append(clean_column_names(rt_df))
 
         if not dfs:
+            print(f"WARNING: No data from KODA API for {date_string} (all 24 hours returned empty)")
+            print(f"  This likely means the API data is not yet available.")
+            print(f"  KODA historical data becomes available 'the next day' but exact time is unspecified.")
+            print(f"  Consider running this pipeline later in the day (after 10:00 UTC).")
             continue
+
+        print(f"KODA API summary for {date_string}: {24 - empty_hours}/24 hours had data, {empty_hours} empty")
 
         daily_rt_df = pd.concat(dfs, ignore_index=True)
 
@@ -252,6 +260,25 @@ def ingest_koda_rt_data(dates, fs):
                     raise
 
         print(f"Completed ingestion for date: {date_string}\n")
+
+        # Verification: Read back data to confirm it was persisted
+        print(f"Verifying data persistence...")
+        verify_df = vehicle_trip_agg_fg.read()
+        verify_df["window_start"] = pd.to_datetime(verify_df["window_start"])
+        verify_df["_date"] = verify_df["window_start"].dt.date
+        unique_dates = sorted(verify_df["_date"].unique())
+        print(f"  Total rows in feature group: {len(verify_df)}")
+        print(f"  Available dates (last 5): {unique_dates[-5:] if len(unique_dates) > 5 else unique_dates}")
+
+        # Check if today's date is in the data
+        today_date = datetime.strptime(date_string, "%Y-%m-%d").date()
+        today_count = len(verify_df[verify_df["_date"] == today_date])
+        print(f"  Rows for {date_string}: {today_count}")
+        if today_count == 0:
+            print(f"  WARNING: Data for {date_string} not found after insert!")
+        else:
+            print(f"  SUCCESS: Data for {date_string} verified in feature group")
+
         return daily_aggregated_df
 
 
