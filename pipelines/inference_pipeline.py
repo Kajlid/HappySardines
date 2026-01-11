@@ -463,8 +463,8 @@ def upload_monitoring(fs, monitor_df: pd.DataFrame):
 
     monitor_fg = fs.get_or_create_feature_group(
         name="monitor_fg",
-        version=1,
-        description="Model monitoring: actual vs predicted occupancy for hindcast analysis",
+        version=2,
+        description="Model monitoring: actual vs predicted occupancy for hindcast analysis (v2: trip_id as string)",
         primary_key=["window_start", "trip_id"],
         event_time="generated_at",
         online_enabled=False,
