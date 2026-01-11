@@ -366,9 +366,9 @@ if not per_class.empty:
     with header_cols[1]:
         st.markdown("**Samples**")
     with header_cols[2]:
-        st.markdown("**Recall**", help="Of all actual X buses, how many did we catch?")
+        st.markdown("**Recall**", help="TP / (TP + FN) — Sensitivity to this class")
     with header_cols[3]:
-        st.markdown("**Precision**", help="When we predict X, how often are we right?")
+        st.markdown("**Precision**", help="TP / (TP + FP) — Positive predictive value")
 
     # Color-coded display for all 7 classes
     for _, row in per_class.iterrows():
@@ -388,7 +388,7 @@ if not per_class.empty:
             if actual_count > 0:
                 st.markdown(f"{actual_count:,}")
             else:
-                st.markdown("—")
+                st.markdown("*Not observed*")
 
         with col3:
             if recall is not None and actual_count > 0:
@@ -404,11 +404,11 @@ if not per_class.empty:
 
     # Explanation
     st.caption("""
-    **Recall**: Of all buses that were actually X, what % did we correctly predict as X? (catches crowded buses)
+    **Recall** = TP / (TP + FN): Of all actual positives, what fraction did we correctly identify? High recall minimizes false negatives.
 
-    **Precision**: Of all buses we predicted as X, what % were actually X? (avoids false alarms)
+    **Precision** = TP / (TP + FP): Of all predicted positives, what fraction were correct? High precision minimizes false positives.
 
-    Classes 4-6 are rare in Swedish transit data.
+    Classes 4-6 (Crowded, Full, Not accepting) are rare in Swedish transit data.
     """)
 else:
     st.info("No per-class metrics available.")
