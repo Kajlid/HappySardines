@@ -264,7 +264,10 @@ def generate_trip_forecasts(model, trips_df: pd.DataFrame) -> pd.DataFrame:
 
 def generate_hindcast_monitoring(model, fs) -> pd.DataFrame:
     """
-    Compare yesterday's predictions to actual data for model monitoring.
+    Compare predictions to actual data for model monitoring.
+
+    Uses the most recent available date in the feature group, falling back
+    from yesterday if data is not available (e.g., due to ingestion issues).
 
     Returns DataFrame with:
     - window_start, trip_id
@@ -273,11 +276,6 @@ def generate_hindcast_monitoring(model, fs) -> pd.DataFrame:
     - model_version
     """
     print("\nGenerating hindcast for monitoring...")
-
-    # Get yesterday's actual data from vehicle_trip_agg_fg
-    yesterday = (datetime.now() - timedelta(days=1)).date()
-    yesterday_str = str(yesterday)
-    print(f"Looking for data from: {yesterday_str}")
 
     try:
         vehicle_fg = fs.get_feature_group("vehicle_trip_agg_fg", version=2)
@@ -290,14 +288,28 @@ def generate_hindcast_monitoring(model, fs) -> pd.DataFrame:
         unique_dates = sorted(vehicle_df["_date"].unique())
         print(f"Available dates in data (last 5): {unique_dates[-5:] if len(unique_dates) > 5 else unique_dates}")
 
-        # Use string comparison to avoid type mismatch issues
+        if not unique_dates:
+            print("No data available in feature group, skipping hindcast")
+            return pd.DataFrame()
+
+        # Try yesterday first, fall back to most recent available date
+        yesterday = (datetime.now() - timedelta(days=1)).date()
+        yesterday_str = str(yesterday)
+
         vehicle_df["_date_str"] = vehicle_df["_date"].astype(str)
         yesterday_df = vehicle_df[vehicle_df["_date_str"] == yesterday_str].copy()
-        print(f"Found {len(yesterday_df)} actual records from {yesterday_str}")
 
         if yesterday_df.empty:
-            print("No actual data for yesterday, skipping hindcast")
-            return pd.DataFrame()
+            # Fall back to most recent available date
+            most_recent_date = unique_dates[-1]
+            most_recent_str = str(most_recent_date)
+            print(f"No data for {yesterday_str}, using most recent date: {most_recent_str}")
+            yesterday_df = vehicle_df[vehicle_df["_date_str"] == most_recent_str].copy()
+            # Update the reference date for weather/holiday lookups
+            yesterday = most_recent_date
+            yesterday_str = most_recent_str
+
+        print(f"Using {len(yesterday_df)} actual records from {yesterday_str} for hindcast")
 
     except Exception as e:
         print(f"Error loading actual data: {e}")
@@ -305,7 +317,7 @@ def generate_hindcast_monitoring(model, fs) -> pd.DataFrame:
         traceback.print_exc()
         return pd.DataFrame()
 
-    # Get weather and holidays for yesterday
+    # Get weather and holidays for the hindcast date
     try:
         weather_fg = fs.get_feature_group("weather_hourly_fg", version=1)
         weather_df = weather_fg.read()
