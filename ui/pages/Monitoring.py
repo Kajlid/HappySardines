@@ -397,7 +397,7 @@ if not per_class.empty:
                 st.markdown("—")
 
         with col4:
-            if precision is not None:
+            if precision is not None and not np.isnan(precision):
                 st.progress(precision, text=f"{precision:.1%}")
             else:
                 st.markdown("—")
