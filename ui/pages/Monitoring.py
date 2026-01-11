@@ -213,7 +213,7 @@ if monitor_df.empty:
     Monitoring data is generated daily by the inference pipeline, which compares
     yesterday's predictions to actual observed occupancy.
 
-    The inference pipeline runs at 09:00 UTC. Check back after it has run at least once.
+    The inference pipeline runs after the feature pipeline completes (~10:30 UTC). Check back after it has run at least once.
     """)
     st.stop()
 
