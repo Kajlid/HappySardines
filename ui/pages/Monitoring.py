@@ -64,7 +64,7 @@ def fetch_monitoring_data():
         project = hopsworks.login()
         fs = project.get_feature_store()
 
-        monitor_fg = fs.get_feature_group("monitor_fg", version=1)
+        monitor_fg = fs.get_feature_group("monitor_fg", version=2)
         df = monitor_fg.read()
 
         if df is not None and not df.empty:
