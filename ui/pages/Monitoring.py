@@ -123,31 +123,45 @@ def get_hourly_comparison(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def get_per_class_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate per-class accuracy and counts for all 7 occupancy classes."""
+    """Calculate per-class recall, precision, and counts for all 7 occupancy classes."""
     if df.empty:
         return pd.DataFrame()
 
     results = []
     # Always show all 7 classes (0-6), even if some have no data
     for cls in range(7):
-        mask = df["actual_occupancy_mode"] == cls
-        subset = df[mask]
+        # Recall: of all actual class X, how many did we predict as X?
+        actual_mask = df["actual_occupancy_mode"] == cls
+        actual_subset = df[actual_mask]
 
-        if len(subset) > 0:
-            correct = (subset["actual_occupancy_mode"] == subset["predicted_occupancy_mode"]).sum()
-            total = len(subset)
-            accuracy = correct / total
+        if len(actual_subset) > 0:
+            correct = (actual_subset["actual_occupancy_mode"] == actual_subset["predicted_occupancy_mode"]).sum()
+            actual_count = len(actual_subset)
+            recall = correct / actual_count
         else:
             correct = 0
-            total = 0
-            accuracy = None  # No data for this class
+            actual_count = 0
+            recall = None
+
+        # Precision: of all predictions of class X, how many were actually X?
+        pred_mask = df["predicted_occupancy_mode"] == cls
+        pred_subset = df[pred_mask]
+
+        if len(pred_subset) > 0:
+            true_positives = (pred_subset["actual_occupancy_mode"] == pred_subset["predicted_occupancy_mode"]).sum()
+            pred_count = len(pred_subset)
+            precision = true_positives / pred_count
+        else:
+            pred_count = 0
+            precision = None
 
         results.append({
             "class": cls,
             "label": OCCUPANCY_LABELS.get(cls, f"Class {cls}"),
-            "count": total,
-            "correct": correct,
-            "accuracy": accuracy,
+            "actual_count": actual_count,
+            "pred_count": pred_count,
+            "recall": recall,
+            "precision": precision,
         })
 
     return pd.DataFrame(results)
@@ -288,7 +302,7 @@ if latest is not None:
 
     with col3:
         render_metric_card(
-            "Precision",
+            "Precision (weighted)",
             latest["precision"],
             threshold_low=0.55,
             threshold_high=0.70
@@ -345,36 +359,56 @@ st.divider()
 st.subheader("Per-Class Performance")
 
 if not per_class.empty:
+    # Header row
+    header_cols = st.columns([2, 1.5, 2, 2])
+    with header_cols[0]:
+        st.markdown("**Class**")
+    with header_cols[1]:
+        st.markdown("**Samples**")
+    with header_cols[2]:
+        st.markdown("**Recall**", help="Of all actual X buses, how many did we catch?")
+    with header_cols[3]:
+        st.markdown("**Precision**", help="When we predict X, how often are we right?")
+
     # Color-coded display for all 7 classes
     for _, row in per_class.iterrows():
         cls = int(row["class"])
         label = row["label"]
-        accuracy = row["accuracy"]
-        count = int(row["count"])
+        recall = row["recall"]
+        precision = row["precision"]
+        actual_count = int(row["actual_count"])
         color = OCCUPANCY_COLORS.get(cls, "#6b7280")
 
-        col1, col2, col3 = st.columns([2, 1, 3])
+        col1, col2, col3, col4 = st.columns([2, 1.5, 2, 2])
 
         with col1:
             st.markdown(f"**{cls}** - {label}")
 
         with col2:
-            if count > 0:
-                st.markdown(f"{count:,} samples")
+            if actual_count > 0:
+                st.markdown(f"{actual_count:,}")
             else:
-                st.markdown("No data", help="No samples of this class in the monitoring data")
+                st.markdown("—")
 
         with col3:
-            if accuracy is not None and count > 0:
-                # Progress bar with color
-                st.progress(accuracy, text=f"{accuracy:.1%}")
+            if recall is not None and actual_count > 0:
+                st.progress(recall, text=f"{recall:.1%}")
             else:
-                st.markdown("—", help="No accuracy data for this class")
+                st.markdown("—")
+
+        with col4:
+            if precision is not None:
+                st.progress(precision, text=f"{precision:.1%}")
+            else:
+                st.markdown("—")
 
     # Explanation
     st.caption("""
-    Per-class accuracy (recall) shows how well the model predicts each occupancy level.
-    Classes 4-6 are rare in Swedish transit data. Lower accuracy for rare classes is expected.
+    **Recall**: Of all buses that were actually X, what % did we correctly predict as X? (catches crowded buses)
+
+    **Precision**: Of all buses we predicted as X, what % were actually X? (avoids false alarms)
+
+    Classes 4-6 are rare in Swedish transit data.
     """)
 else:
     st.info("No per-class metrics available.")
